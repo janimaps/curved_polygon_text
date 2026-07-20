@@ -1,0 +1,36 @@
+[general]
+name=Curved & Polygon Text (For Layouts)
+qgisMinimumVersion=3.44
+qgisMaximumVersion=4.99
+description=Adds advanced Curved Spline Text and Polygon Text Box items to the QGIS Layout Designer, complete with HTML rendering, drop shadows, and full formatting control.
+version=1.0.0
+author=Jani Maps
+email=info@janimaps.co.ke
+
+about=Bridges a feature gap in the QGIS Print Layout engine by introducing two
+    new layout item types:
+
+    * Curved Spline Text -- flows rich/HTML text along an editable, draggable
+      curve (polyline) instead of a straight baseline.
+    * Polygon Shaped Text Box -- wraps rich/HTML text to fit exactly inside an
+      editable, draggable closed polygon outline instead of a rectangle.
+
+    Both items support "Allow HTML Formatting" rich text (bold, italic,
+    colour spans, etc.) and automatic evaluation of QGIS expressions written
+    as [%% ... %%], exactly like the native Add Label item.
+
+    Requires QGIS 3.44 or later. The same codebase supports QGIS 3.44 LTR
+    (PyQt5/Qt5) and QGIS 4.x (PyQt6/Qt6).
+
+tracker=https://github.com/janimaps/curved_polygon_text/issues
+repository=https://github.com/janimaps/curved_polygon_text
+homepage=https://github.com/janimaps/curved_polygon_text
+hasProcessingProvider=no
+tags=layout,print layout,atlas,text,typography,curved text,spline,path text,polygon text,expression,node editing,html,cartography
+category=Layouts
+icon=resources/polygon.png
+experimental=False
+deprecated=False
+server=False
+
+# Packaging note: Toolbar integration targets the lower Actions toolbar row.
