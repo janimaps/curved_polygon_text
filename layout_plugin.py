@@ -19,6 +19,7 @@ from qgis.core import (
     QgsApplication,
     QgsLayoutItemAbstractMetadata,
     QgsMessageLog,
+    QgsProject,
     Qgis,
 )
 from qgis.gui import (
@@ -46,6 +47,12 @@ from .layout_item_polygon_text import LayoutItemPolygonText, POLYGON_TEXT_ITEM_T
 from .layout_item_spline_text import LayoutItemSplineText, SPLINE_TEXT_ITEM_TYPE
 from .node_edit_tool import NodeEditTool
 from .icons import edit_spline_icon, polygon_icon, spline_icon
+from .recovery import (
+    schedule_layout_snapshot,
+    schedule_recovery,
+    snapshot_layout,
+    snapshot_project,
+)
 
 
 LOG_TAG = "Curved/Polygon Text"
@@ -197,6 +204,9 @@ class CurvedPolygonTextPlugin(QObject):
         self._designer_closing_signal = None
         self._scan_scheduled = False
         self._event_filter_installed = False
+        self._project_write_signal = None
+        self._project_read_signal = None
+        self._layout_added_signal = None
 
         self._item_metadata = []
         self._gui_metadata = []
@@ -208,17 +218,184 @@ class CurvedPolygonTextPlugin(QObject):
         """Called by QGIS when the plugin is enabled."""
         self._loaded = True
         self._register_layout_items()
+        self._connect_recovery_signals()
         self._connect_layout_designer_signals()
         self._install_event_filter()
         self._schedule_scan()
 
     def unload(self):
         """Called by QGIS when the plugin is disabled or unloaded."""
+        # Capture one final manifest while all live custom items still exist.
+        try:
+            snapshot_project(QgsProject.instance())
+        except Exception:
+            record_suppressed_exception()
         self._loaded = False
+        self._disconnect_recovery_signals()
         self._disconnect_layout_designer_signals()
         self._remove_event_filter()
         self._remove_all_actions()
         self._unregister_layout_items()
+
+    # ---- Durable project recovery ---------------------------------------------
+
+    def _connect_recovery_signals(self):
+        """Keep a QGIS-core-preserved backup of all custom layout items."""
+        project = QgsProject.instance()
+
+        # QgsProject.writeProject is emitted for normal saves and autosaves.
+        # Updating the layout custom property here ensures intentional edits/
+        # deletions made while the plugin is active become the authoritative
+        # manifest before QGIS serializes the project.
+        signal = getattr(project, "writeProject", None)
+        if signal is not None:
+            try:
+                signal.connect(self._on_project_write)
+                self._project_write_signal = signal
+            except Exception:
+                self._project_write_signal = None
+                record_suppressed_exception()
+
+        # QgisInterface.projectRead fires after layouts have been deserialized.
+        # It is preferable to QgsProject.readProject here because recovery must
+        # happen after QGIS has finished constructing all standard layout items.
+        signal = getattr(self.iface, "projectRead", None)
+        if signal is not None:
+            try:
+                signal.connect(self._on_project_read)
+                self._project_read_signal = signal
+            except Exception:
+                self._project_read_signal = None
+                record_suppressed_exception()
+
+        manager = project.layoutManager()
+        if manager is not None:
+            signal = getattr(manager, "layoutAdded", None)
+            if signal is not None:
+                try:
+                    signal.connect(self._on_recovery_layout_added)
+                    self._layout_added_signal = signal
+                except Exception:
+                    self._layout_added_signal = None
+                    record_suppressed_exception()
+
+        self._watch_all_recovery_layouts()
+
+        # The plugin can be enabled after a project is already open.
+        schedule_recovery(project, self._after_recovery)
+
+    def _disconnect_recovery_signals(self):
+        if self._project_write_signal is not None:
+            try:
+                self._project_write_signal.disconnect(self._on_project_write)
+            except Exception:
+                record_suppressed_exception()
+        self._project_write_signal = None
+
+        if self._project_read_signal is not None:
+            try:
+                self._project_read_signal.disconnect(self._on_project_read)
+            except Exception:
+                record_suppressed_exception()
+        self._project_read_signal = None
+
+        if self._layout_added_signal is not None:
+            try:
+                self._layout_added_signal.disconnect(self._on_recovery_layout_added)
+            except Exception:
+                record_suppressed_exception()
+        self._layout_added_signal = None
+
+    def _on_project_write(self, *args):
+        try:
+            snapshot_project(QgsProject.instance())
+        except Exception:
+            record_suppressed_exception()
+
+    def _on_project_read(self, *args):
+        self._watch_all_recovery_layouts()
+        schedule_recovery(QgsProject.instance(), self._after_recovery)
+
+    def _after_recovery(self, count):
+        self._watch_all_recovery_layouts()
+        self._report_recovery(count)
+
+    def _watch_all_recovery_layouts(self):
+        try:
+            manager = QgsProject.instance().layoutManager()
+            layouts = manager.layouts() if manager is not None else []
+        except Exception:
+            layouts = []
+        for layout in layouts:
+            self._watch_recovery_layout(layout)
+
+    def _watch_recovery_layout(self, layout):
+        if layout is None:
+            return
+        try:
+            already = bool(getattr(layout, "_curved_polygon_recovery_watched", False))
+        except Exception:
+            already = False
+        if not already:
+            try:
+                layout.itemAdded.connect(self._on_recovery_item_added)
+                layout._curved_polygon_recovery_watched = True
+            except Exception:
+                record_suppressed_exception()
+
+        try:
+            items = layout.items()
+        except Exception:
+            items = []
+        for item in items:
+            if isinstance(item, (LayoutItemPolygonText, LayoutItemSplineText)):
+                self._watch_recovery_item(item)
+
+    def _watch_recovery_item(self, item):
+        try:
+            if getattr(item, "_curved_polygon_recovery_watched", False):
+                return
+            item._curved_polygon_recovery_watched = True
+            layout = item.layout()
+            layout_name = layout.name() if layout is not None else ""
+            # A destroyed custom item means the active manifest must be
+            # refreshed after the item has actually left the scene.  Capture
+            # only the layout name -- never the QgsLayout wrapper -- because
+            # Qt may destroy the underlying QGraphicsScene before a zero-delay
+            # callback executes.  The callback resolves a fresh live layout
+            # from QgsLayoutManager and safely does nothing if it was closed.
+            item.destroyed.connect(
+                lambda *_args, layout_name=layout_name: schedule_layout_snapshot(
+                    layout_name
+                )
+            )
+        except Exception:
+            record_suppressed_exception()
+
+    def _on_recovery_item_added(self, item):
+        if not isinstance(item, (LayoutItemPolygonText, LayoutItemSplineText)):
+            return
+        self._watch_recovery_item(item)
+        try:
+            snapshot_layout(item.layout())
+        except Exception:
+            record_suppressed_exception()
+
+    def _on_recovery_layout_added(self, name):
+        try:
+            layout = QgsProject.instance().layoutManager().layoutByName(name)
+        except Exception:
+            layout = None
+        self._watch_recovery_layout(layout)
+
+    def _report_recovery(self, count):
+        if not count:
+            return
+        self._log(
+            f"Recovered {count} Curved/Polygon Text layout item"
+            f"{'s' if count != 1 else ''} from the persistent project backup.",
+            Qgis.MessageLevel.Info,
+        )
 
     # ---- Layout item registration ---------------------------------------------
 

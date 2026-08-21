@@ -744,6 +744,8 @@ class LayoutItemPolygonText(QgsLayoutItem):
             QPointF(0.0, 0.0), QPointF(1.0, 0.0),
             QPointF(1.0, 1.0), QPointF(0.0, 1.0),
         ]
+        # Transient edit-state only.  This is deliberately not serialized.
+        self._active_node_index = -1
         # Transient cache for the layout plan.  The cache key excludes zoom so
         # line breaks stay pinned once composed.
         self._layout_cache_key = None
@@ -839,6 +841,18 @@ class LayoutItemPolygonText(QgsLayoutItem):
         return result
 
     # --------------------------------------------------------- node access
+    def setActiveNodeIndex(self, index):
+        """Highlight the node currently targeted by the node-edit tool."""
+        index = int(index) if index is not None else -1
+        if index < 0 or index >= len(self._nodes):
+            index = -1
+        if index != self._active_node_index:
+            self._active_node_index = index
+            self.update()
+
+    def activeNodeIndex(self):
+        return self._active_node_index
+
     def nodeScenePositions(self):
         rect = self.rect()
         return [
@@ -1155,12 +1169,23 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 painter.save()
                 try:
                     painter.setClipping(False)
-                    painter.setPen(QPen(
-                        QColor(40, 140, 90), 0.25 * scale_factor))
-                    painter.setBrush(QColor(255, 255, 255))
+                    normal_pen = QPen(
+                        QColor(40, 140, 90), 0.25 * scale_factor)
+                    active_pen = QPen(
+                        QColor(190, 85, 0), 0.35 * scale_factor)
+                    normal_brush = QColor(255, 255, 255)
+                    active_brush = QColor(255, 170, 45)
                     r = 1.4 * scale_factor
-                    for pt in poly_px:
-                        painter.drawEllipse(pt, r, r)
+                    active_r = 1.7 * scale_factor
+                    for index, pt in enumerate(poly_px):
+                        if index == self._active_node_index:
+                            painter.setPen(active_pen)
+                            painter.setBrush(active_brush)
+                            painter.drawEllipse(pt, active_r, active_r)
+                        else:
+                            painter.setPen(normal_pen)
+                            painter.setBrush(normal_brush)
+                            painter.drawEllipse(pt, r, r)
                 finally:
                     painter.restore()
         finally:
@@ -2063,6 +2088,44 @@ class LayoutItemPolygonText(QgsLayoutItem):
         if avail_bottom <= avail_top or inner_right <= inner_left:
             return
 
+        html_list_ranges = (
+            html_block_spacing.get("list_ranges", []) if render_html else []
+        )
+
+        def _list_insets_for_offset(offset):
+            """Return (first-line inset, continuation inset) for an HTML list.
+
+            QTextDocument stores list indentation as block metadata, not as
+            characters.  Our polygon compositor flattens the document in order
+            to wrap against a variable-width polygon, so reproduce that block
+            indentation geometrically instead of inserting leading whitespace
+            which QgsTextRenderer may collapse at row starts.
+            """
+            for info in html_list_ranges:
+                try:
+                    start = int(info.get("start", -1))
+                    end = int(info.get("end", -1))
+                    current_offset = int(offset)
+                    level = max(1, int(info.get("level", 1)))
+                except (TypeError, ValueError, AttributeError):
+                    start = end = current_offset = -1
+                    level = 1
+
+                if start <= current_offset < end:
+                    marker = str(info.get("marker", ""))
+                    # Qt's default QTextDocument list indent is generous
+                    # (roughly a couple of ems per nesting level).  Express
+                    # it through the active font metrics so it scales with
+                    # the QGIS text size and render context.
+                    em = max(1.0, float(fm.horizontalAdvance("M")))
+                    base = 2.0 * em * level
+                    hanging = max(
+                        0.75 * em,
+                        float(fm.horizontalAdvance(marker + " "))
+                    )
+                    return start, base, base + hanging
+            return None
+
         def _compose_rows(candidate_y):
             """Lay out once for measurement and rendering.
 
@@ -2095,9 +2158,21 @@ class LayoutItemPolygonText(QgsLayoutItem):
                         cy + ph + visual_pad_y,
                         pad_px, hm_px, visual_pad_x)
                     if span and span[1] - span[0] > 1.0:
-                        width = span[1] - span[0]
+                        line_start = qline.textStart()
+                        list_insets = _list_insets_for_offset(line_start)
+                        left = span[0]
+                        if list_insets is not None:
+                            list_start, first_inset, continuation_inset = list_insets
+                            left += (
+                                first_inset if line_start == list_start
+                                else continuation_inset
+                            )
+                        width = span[1] - left
+                        if width <= 1.0:
+                            cy += ph
+                            continue
                         qline.setLineWidth(width)
-                        chosen = (span[0], width, cy)
+                        chosen = (left, width, cy)
                         if qline.naturalTextWidth() <= width + 0.5:
                             break
                     cy += ph
@@ -2280,6 +2355,14 @@ class LayoutItemPolygonText(QgsLayoutItem):
         pass
     # ------------------------------------------------------------ persistence
     def writePropertiesToElement(self, element, document, context):
+        # Refresh the redundant layout-level recovery manifest while QGIS is
+        # writing this item. QgsLayout writes its custom properties after its
+        # items, so this backup is included in the same project save/autosave.
+        try:
+            from .recovery import snapshot_item_layout
+            snapshot_item_layout(self)
+        except Exception:
+            record_suppressed_exception()
         element.setAttribute("polyText",     self._text)
         element.setAttribute("polyHtml", "1" if self._allow_html else "0")
         element.setAttribute("polyPadding",  str(self._padding))

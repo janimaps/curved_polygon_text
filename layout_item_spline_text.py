@@ -1678,6 +1678,8 @@ class LayoutItemSplineText(QgsLayoutItem):
             QPointF(0.5,  0.2),
             QPointF(0.95, 0.5),
         ]
+        # Transient edit-state only.  This is deliberately not serialized.
+        self._active_node_index = -1
         # Cache the composed glyph layout so zoom redraws do not reflow text.
         self._layout_cache_key = None
         self._layout_cache = None
@@ -1981,6 +1983,18 @@ class LayoutItemSplineText(QgsLayoutItem):
         return max(inherited, 1.65)
 
     # --------------------------------------------------------- node access
+    def setActiveNodeIndex(self, index):
+        """Highlight the node currently targeted by the node-edit tool."""
+        index = int(index) if index is not None else -1
+        if index < 0 or index >= len(self._nodes):
+            index = -1
+        if index != self._active_node_index:
+            self._active_node_index = index
+            self.update()
+
+    def activeNodeIndex(self):
+        return self._active_node_index
+
     def nodesNormalised(self): return list(self._nodes)
 
     def nodeScenePositions(self):
@@ -2894,11 +2908,21 @@ class LayoutItemSplineText(QgsLayoutItem):
             painter.restore()
 
     def _draw_handles(self, painter, nodes_px, scale_factor):
-        painter.setPen(QPen(QColor(40,90,200), 0.25*scale_factor))
-        painter.setBrush(QColor(255,255,255))
+        normal_pen = QPen(QColor(40,90,200), 0.25*scale_factor)
+        active_pen = QPen(QColor(190,85,0), 0.35*scale_factor)
+        normal_brush = QColor(255,255,255)
+        active_brush = QColor(255,170,45)
         r = 1.4 * scale_factor
-        for pt in nodes_px:
-            painter.drawEllipse(pt, r, r)
+        active_r = 1.7 * scale_factor
+        for index, pt in enumerate(nodes_px):
+            if index == self._active_node_index:
+                painter.setPen(active_pen)
+                painter.setBrush(active_brush)
+                painter.drawEllipse(pt, active_r, active_r)
+            else:
+                painter.setPen(normal_pen)
+                painter.setBrush(normal_brush)
+                painter.drawEllipse(pt, r, r)
 
 
     # ---- QgsLayoutItem overrides (no rectangular background/frame) -----
@@ -2911,6 +2935,14 @@ class LayoutItemSplineText(QgsLayoutItem):
         pass
     # ------------------------------------------------------------ persistence
     def writePropertiesToElement(self, element, document, context):
+        # Refresh the redundant layout-level recovery manifest while QGIS is
+        # writing this item. QgsLayout writes its custom properties after its
+        # items, so this backup is included in the same project save/autosave.
+        try:
+            from .recovery import snapshot_item_layout
+            snapshot_item_layout(self)
+        except Exception:
+            record_suppressed_exception()
         element.setAttribute("splineText",    self._text)
         element.setAttribute("splineHtml", "1" if self._allow_html else "0")
         element.setAttribute("splineHAlign",  str(self._h_align))

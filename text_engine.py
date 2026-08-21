@@ -137,6 +137,233 @@ def _inline_html_font(base_font, char_format):
     return out
 
 
+def _alpha_list_marker(number, upper=False):
+    """Return 1-based spreadsheet-style alphabetic list markers."""
+    number = max(1, int(number))
+    chars = []
+    while number:
+        number -= 1
+        chars.append(chr(ord("A" if upper else "a") + (number % 26)))
+        number //= 26
+    return "".join(reversed(chars))
+
+
+def _roman_list_marker(number, upper=False):
+    """Return a compact Roman numeral for positive ordered-list indexes."""
+    number = max(1, int(number))
+    values = (
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    )
+    out = []
+    for value, glyphs in values:
+        while number >= value:
+            out.append(glyphs)
+            number -= value
+    marker = "".join(out)
+    return marker if upper else marker.lower()
+
+
+def _text_list_style(name):
+    """Resolve QTextListFormat style enums across Qt 5 and Qt 6."""
+    cls = getattr(QtGui, "QTextListFormat", None)
+    if cls is None:
+        return None
+    value = getattr(cls, name, None)
+    if value is not None:
+        return value
+    scoped = getattr(cls, "Style", None)
+    return getattr(scoped, name, None) if scoped is not None else None
+
+
+def _same_list_style(value, name):
+    expected = _text_list_style(name)
+    if expected is None:
+        return False
+    if value == expected:
+        return True
+    try:
+        return int(value) == int(expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def _html_list_marker_font(base_font):
+    """Return a stable font used only for unordered-list marker glyphs.
+
+    List bullets must not inherit the surrounding text family, condensed
+    width, italic style, letter spacing or other font-specific metrics. Pick
+    a predictable sans face available on the current system, force a normal
+    width/upright heavy style, and scale the marker slightly above the text
+    size so disc/circle/square remain visually prominent across font changes.
+    """
+    try:
+        families = set(QtGui.QFontDatabase.families())
+    except Exception:
+        families = set()
+
+    family = None
+    for candidate in (
+            "DejaVu Sans", "Arial", "Liberation Sans", "Noto Sans",
+            "Segoe UI", "Sans Serif"):
+        if not families or candidate in families:
+            family = candidate
+            if candidate in families:
+                break
+    try:
+        marker_font = QFont(family or "Sans Serif")
+    except Exception:
+        marker_font = QFont(base_font)
+
+    try:
+        pt = float(base_font.pointSizeF())
+        if pt > 0:
+            marker_font.setPointSizeF(pt * 1.10)
+        elif base_font.pixelSize() > 0:
+            marker_font.setPixelSize(max(1, int(round(base_font.pixelSize() * 1.10))))
+    except Exception:
+        record_suppressed_exception()
+
+    try:
+        # Use an explicit heavy weight without inheriting the user's font
+        # style. Qt5 and Qt6 expose the weight enums differently.
+        weight_enum = getattr(QFont, "Weight", None)
+        bold_weight = getattr(weight_enum, "Bold", None) if weight_enum else None
+        if bold_weight is None:
+            bold_weight = getattr(QFont, "Bold", 75)
+        marker_font.setWeight(bold_weight)
+    except Exception:
+        try:
+            marker_font.setBold(True)
+        except Exception:
+            record_suppressed_exception()
+    try:
+        marker_font.setItalic(False)
+        marker_font.setUnderline(False)
+        marker_font.setStrikeOut(False)
+        marker_font.setOverline(False)
+        marker_font.setStretch(100)
+        marker_font.setWordSpacing(0.0)
+        spacing_type = getattr(QFont, "SpacingType", None)
+        absolute = getattr(spacing_type, "AbsoluteSpacing", None) if spacing_type else None
+        if absolute is None:
+            absolute = getattr(QFont, "AbsoluteSpacing", None)
+        if absolute is not None:
+            marker_font.setLetterSpacing(absolute, 0.0)
+    except Exception:
+        record_suppressed_exception()
+    return marker_font
+
+
+def _is_unordered_list_marker(marker_text):
+    try:
+        return bool(marker_text) and marker_text[0] in ("\u25cf", "\u25cb", "\u25a0")
+    except Exception:
+        return False
+
+
+def _html_list_marker(block):
+    """Return a visible, render-safe list prefix for a QTextDocument block.
+
+    QTextDocument stores <ul>/<ol> bullets/numbers and list indentation in
+    QTextList metadata rather than fragment text. The polygon/spline HTML
+    compositor flattens those fragments, so materialise the marker here.
+
+    Do not inject literal TAB characters: QTextLayout and QgsTextRenderer
+    normalise tabs differently once a flattened row is serialised back to
+    inline HTML, which can make measured and painted rows diverge. Use Unicode
+    typographic spacing glyphs instead. These survive HTML serialisation as
+    real characters and scale with the active font, while preserving a
+    QGIS-like inset and marker-to-text gap.
+    """
+    try:
+        text_list = block.textList()
+    except Exception:
+        return ""
+    if text_list is None:
+        return ""
+
+    try:
+        fmt = text_list.format()
+        style = fmt.style()
+    except Exception:
+        return ""
+
+    if _same_list_style(style, "ListStyleUndefined"):
+        return ""
+
+    try:
+        indent_level = max(1, int(fmt.indent()))
+    except Exception:
+        indent_level = 1
+
+    marker = None
+    if _same_list_style(style, "ListDisc"):
+        marker = "\u25cf"
+    elif _same_list_style(style, "ListCircle"):
+        marker = "\u25cb"
+    elif _same_list_style(style, "ListSquare"):
+        marker = "\u25a0"
+
+    try:
+        number = int(text_list.itemNumber(block)) + 1
+    except Exception:
+        number = 1
+
+    start_getter = getattr(fmt, "start", None)
+    if callable(start_getter):
+        try:
+            list_start = int(start_getter())
+        except (TypeError, ValueError):
+            list_start = 1
+        if list_start > 0:
+            number += list_start - 1
+
+    if marker is None:
+        if _same_list_style(style, "ListLowerAlpha"):
+            marker = f"{_alpha_list_marker(number, False)}."
+        elif _same_list_style(style, "ListUpperAlpha"):
+            marker = f"{_alpha_list_marker(number, True)}."
+        elif _same_list_style(style, "ListLowerRoman"):
+            marker = f"{_roman_list_marker(number, False)}."
+        elif _same_list_style(style, "ListUpperRoman"):
+            marker = f"{_roman_list_marker(number, True)}."
+        elif _same_list_style(style, "ListDecimal"):
+            marker = f"{number}."
+
+    if marker is None:
+        try:
+            style_name = str(style.name).lower()
+        except Exception:
+            style_name = str(style).lower()
+        if "disc" in style_name:
+            marker = "\u25cf"
+        elif "circle" in style_name:
+            marker = "\u25cb"
+        elif "square" in style_name:
+            marker = "\u25a0"
+        elif "loweralpha" in style_name:
+            marker = f"{_alpha_list_marker(number, False)}."
+        elif "upperalpha" in style_name:
+            marker = f"{_alpha_list_marker(number, True)}."
+        elif "lowerroman" in style_name:
+            marker = f"{_roman_list_marker(number, False)}."
+        elif "upperroman" in style_name:
+            marker = f"{_roman_list_marker(number, True)}."
+        elif "decimal" in style_name:
+            marker = f"{number}."
+
+    if marker is None:
+        return ""
+
+    # The marker itself remains in the flattened text stream, but the list
+    # block indentation is applied geometrically by the polygon compositor.
+    # Leading spacing glyphs are intentionally avoided here: QGIS/Qt HTML
+    # rendering can collapse or discard them at the start of a row.
+    return marker + "\u2002"
+
+
 def extract_segments(text, allow_html, base_font, base_color,
                      preserve_source_newlines=False,
                      overlay_base_font=False, block_spacing_out=None):
@@ -158,7 +385,8 @@ def extract_segments(text, allow_html, base_font, base_color,
     if block_spacing_out is not None:
         block_spacing_out.clear()
         block_spacing_out.update({
-            "leading": 0.0, "trailing": 0.0, "breaks": {}})
+            "leading": 0.0, "trailing": 0.0, "breaks": {},
+            "list_ranges": []})
     if not text:
         return segments
 
@@ -206,6 +434,22 @@ def extract_segments(text, allow_html, base_font, base_color,
             block_spacing_out["leading"] = top_margin
         first_block = False
 
+        list_marker = _html_list_marker(block)
+        marker_emitted = False
+        list_block_start = plain_offset
+        list_indent_level = 0
+        list_marker_text = ""
+        if list_marker:
+            try:
+                text_list = block.textList()
+                if text_list is not None:
+                    list_indent_level = max(1, int(text_list.format().indent()))
+            except Exception:
+                list_indent_level = 1
+            # Keep the visible marker separately so the polygon compositor can
+            # calculate a hanging indent for wrapped continuation lines.
+            list_marker_text = list_marker.rstrip("\u2002")
+
         it = block.begin()
         while not it.atEnd():
             frag = it.fragment()
@@ -229,6 +473,17 @@ def extract_segments(text, allow_html, base_font, base_color,
                 brush = fmt.foreground()
                 color = brush.color() if brush.style() != NO_BRUSH else QColor(base_color)
 
+                if list_marker and not marker_emitted:
+                    marker_font = (
+                        _html_list_marker_font(base_font)
+                        if _is_unordered_list_marker(list_marker)
+                        else QFont(font)
+                    )
+                    segments.append(Segment(
+                        list_marker, marker_font, QColor(color)))
+                    plain_offset += len(list_marker)
+                    marker_emitted = True
+
                 # Qt represents a <br> *inside* a paragraph as U+2028
                 # (LINE SEPARATOR) within the fragment text, rather than
                 # as a new block -- split on it so spline/polygon
@@ -242,6 +497,27 @@ def extract_segments(text, allow_html, base_font, base_color,
                         segments.append(Segment("\n", font, color))
                         plain_offset += 1
             it += 1
+
+        # Empty <li></li> blocks contain no text fragment, but the list marker
+        # is still visible in native QGIS/Qt HTML rendering.
+        if list_marker and not marker_emitted:
+            marker_font = (
+                _html_list_marker_font(base_font)
+                if _is_unordered_list_marker(list_marker)
+                else QFont(base_font)
+            )
+            segments.append(Segment(
+                list_marker, marker_font, QColor(base_color)))
+            plain_offset += len(list_marker)
+
+        if list_marker and block_spacing_out is not None:
+            block_spacing_out.setdefault("list_ranges", []).append({
+                "start": int(list_block_start),
+                "end": int(plain_offset),
+                "level": int(max(1, list_indent_level)),
+                "marker": str(list_marker_text),
+            })
+
         previous_bottom_margin = bottom_margin
         block = block.next()
 

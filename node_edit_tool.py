@@ -39,6 +39,8 @@ class NodeEditTool(QgsLayoutViewTool):
         self.setCursor(CURSOR_CROSS)
         self._drag_item = None
         self._drag_index = -1
+        self._highlight_item = None
+        self._highlight_index = -1
         self._pan_active = False
         self._pan_last_pos = None
 
@@ -64,6 +66,31 @@ class NodeEditTool(QgsLayoutViewTool):
         position = getattr(event, "position", None)
         return position() if callable(position) else event.pos()
 
+    def _set_highlight(self, item, index):
+        """Show which node will be moved/deleted before the user clicks it."""
+        if item is self._highlight_item and index == self._highlight_index:
+            return
+        if self._highlight_item is not None:
+            setter = getattr(self._highlight_item, "setActiveNodeIndex", None)
+            if callable(setter):
+                try:
+                    setter(-1)
+                except RuntimeError:
+                    # The wrapped QGIS item may already have been deleted.
+                    self._highlight_item = None
+
+        self._highlight_item = item
+        self._highlight_index = index if item is not None else -1
+        if item is not None:
+            setter = getattr(item, "setActiveNodeIndex", None)
+            if callable(setter):
+                try:
+                    setter(index)
+                except RuntimeError:
+                    # Do not retain a stale/deleted wrapped layout item.
+                    self._highlight_item = None
+                    self._highlight_index = -1
+
     # ------------------------------------------------ QgsLayoutViewTool API
     def layoutPressEvent(self, event):
         if event.button() == MIDDLE_BUTTON:
@@ -81,6 +108,7 @@ class NodeEditTool(QgsLayoutViewTool):
         if event.button() == LEFT_BUTTON:
             idx = self._node_at(item, scene_pos)
             if idx >= 0:
+                self._set_highlight(item, idx)
                 item.beginCommand("Move Node")
                 self._drag_item = item
                 self._drag_index = idx
@@ -88,11 +116,13 @@ class NodeEditTool(QgsLayoutViewTool):
         elif event.button() == RIGHT_BUTTON:
             idx = self._node_at(item, scene_pos)
             if idx >= 0:
+                self._set_highlight(item, idx)
                 item.beginCommand("Delete Node")
                 if item.removeNodeAt(idx):
                     item.endCommand()
                 else:
                     item.cancelCommand()
+                self._set_highlight(None, -1)
 
     def layoutMoveEvent(self, event):
         if self._pan_active and self._pan_last_pos is not None:
@@ -106,7 +136,16 @@ class NodeEditTool(QgsLayoutViewTool):
             return
 
         if self._drag_item is not None and self._drag_index >= 0:
+            self._set_highlight(self._drag_item, self._drag_index)
             self._drag_item.setNodeAtScenePos(self._drag_index, event.layoutPoint())
+            return
+
+        item = self._active_node_item()
+        if item is None:
+            self._set_highlight(None, -1)
+            return
+        idx = self._node_at(item, event.layoutPoint())
+        self._set_highlight(item, idx) if idx >= 0 else self._set_highlight(None, -1)
 
     def layoutReleaseEvent(self, event):
         if event.button() == MIDDLE_BUTTON and self._pan_active:
@@ -139,6 +178,7 @@ class NodeEditTool(QgsLayoutViewTool):
             self._drag_item.cancelCommand()
         self._drag_item = None
         self._drag_index = -1
+        self._set_highlight(None, -1)
         self._pan_active = False
         self._pan_last_pos = None
         super().deactivate()
