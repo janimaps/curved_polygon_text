@@ -31,12 +31,76 @@ and any future fix (e.g. better HTML parsing) benefits both at once.
 import math
 from dataclasses import dataclass
 
-from qgis.core import QgsExpression, QgsMessageLog, Qgis, QgsTextDocument
+from qgis.core import (
+    QgsExpression, QgsMessageLog, Qgis, QgsTextDocument, QgsTextFormat,
+)
 
 from .compat import QtGui, QFont, QColor, QTextDocument, QTextLayout, QTextCharFormat, QBrush, NO_BRUSH, QPainterPath
 from .reliability import record_suppressed_exception
 
 LOG_TAG = "Curved/Polygon Text"
+
+
+# ======================================================== canonical font size
+def text_format_base_font(text_format, resolve_named_style=False):
+    """Return the one authoritative base font for every text render mode.
+
+    QgsTextFormat owns the user-facing size and its unit.  Qt's rich-text
+    document otherwise falls back to the QFont's independently stored point
+    size, which can be stale after editing the QGIS Font panel.  Keeping the
+    QFont synchronised here means plain text, native Allow HTML formatting and
+    plugin Render as HTML all begin with the exact same configured size.
+    """
+    try:
+        font = QFont(text_format.font())
+    except Exception:
+        font = QFont()
+
+    if resolve_named_style:
+        try:
+            from qgis.core import QgsFontUtils
+            family = font.family()
+            if family:
+                try:
+                    QgsFontUtils.setFontFamily(font, family)
+                except Exception:
+                    font.setFamily(family)
+            named_style = text_format.namedStyle()
+            if named_style:
+                if not QgsFontUtils.updateFontViaStyle(font, named_style, True):
+                    font.setStyleName(named_style)
+        except Exception:
+            record_suppressed_exception()
+
+    try:
+        size = float(text_format.size())
+    except Exception:
+        size = 0.0
+    if size > 0.0:
+        # The QFont is the default inherited by parsed HTML.  QGIS still
+        # applies sizeUnit()/sizeMapUnitScale() when it renders the format.
+        font.setPointSizeF(size)
+    elif font.pointSizeF() <= 0 and font.pixelSize() <= 0:
+        font.setPointSizeF(10.0)
+
+    for forced_getter, setter in (("forcedBold", "setBold"),
+                                  ("forcedItalic", "setItalic")):
+        try:
+            if getattr(text_format, forced_getter)():
+                getattr(font, setter)(True)
+        except Exception:
+            record_suppressed_exception()
+    return font
+
+
+def normalised_text_format_font(text_format, resolve_named_style=False):
+    """Clone a format with its QFont aligned to the canonical size source."""
+    try:
+        result = QgsTextFormat(text_format)
+        result.setFont(text_format_base_font(result, resolve_named_style))
+        return result
+    except Exception:
+        return text_format
 
 
 # ============================================================ expressions
@@ -132,6 +196,71 @@ def _inline_html_font(base_font, char_format):
         try:
             out.setLetterSpacing(
                 parsed.letterSpacingType(), parsed.letterSpacing())
+        except Exception:
+            record_suppressed_exception()
+    return out
+
+
+def _qgis_inline_html_font(base_font, char_format):
+    """Apply a QGIS character-format run to the canonical base font.
+
+    ``QgsTextDocument`` yields ``QgsTextCharacterFormat`` objects, not Qt
+    ``QTextCharFormat`` objects.  They intentionally expose QGIS getters
+    rather than ``font()``/``hasProperty()``.  Keep this adapter separate from
+    the Qt HTML adapter above so the two document APIs can never be confused.
+    The caller supplies a normalised ``QgsTextFormat``, therefore inherited
+    values in a run already equal the canonical base font.
+    """
+    out = QFont(base_font)
+
+    def enum_override(value, inherited):
+        try:
+            name = value.name.lower()
+        except Exception:
+            name = str(value).lower()
+        if "settrue" in name:
+            return True
+        if "setfalse" in name:
+            return False
+        return inherited
+
+    def set_weight(weight):
+        try:
+            value = int(weight)
+            if value < 0:
+                return
+            scoped = getattr(QFont, "Weight", None)
+            out.setWeight(scoped(value) if scoped is not None else value)
+        except Exception:
+            record_suppressed_exception()
+
+    try:
+        family = char_format.family()
+        if family:
+            out.setFamily(family)
+    except Exception:
+        record_suppressed_exception()
+    try:
+        point_size = float(char_format.fontPointSize())
+        percentage_size = float(char_format.fontPercentageSize())
+        if point_size > 0:
+            out.setPointSizeF(point_size)
+        elif percentage_size > 0 and out.pointSizeF() > 0:
+            out.setPointSizeF(out.pointSizeF() * percentage_size)
+    except Exception:
+        record_suppressed_exception()
+    try:
+        set_weight(char_format.fontWeight())
+    except Exception:
+        record_suppressed_exception()
+    for getter, setter, inherited in (
+            ("italic", "setItalic", out.italic()),
+            ("underline", "setUnderline", out.underline()),
+            ("strikeOut", "setStrikeOut", out.strikeOut()),
+            ("overline", "setOverline", out.overline())):
+        try:
+            getattr(out, setter)(enum_override(
+                getattr(char_format, getter)(), inherited))
         except Exception:
             record_suppressed_exception()
     return out
@@ -544,33 +673,6 @@ def extract_qgis_html_segments(text, text_format, base_font, base_color):
             normalized, True, base_font, base_color,
             preserve_source_newlines=True, overlay_base_font=True)
 
-    def _enum_override(value, inherited):
-        try:
-            name = value.name.lower()
-        except Exception:
-            name = str(value).lower()
-        if "settrue" in name:
-            return True
-        if "setfalse" in name:
-            return False
-        return inherited
-
-    def _set_weight(font, weight):
-        try:
-            weight = int(weight)
-        except Exception:
-            return
-        if weight < 0:
-            return
-        try:
-            scoped = getattr(QFont, "Weight", None)
-            font.setWeight(scoped(weight) if scoped is not None else weight)
-        except Exception:
-            try:
-                font.setWeight(weight)
-            except Exception:
-                record_suppressed_exception()
-
     segments = []
     try:
         block_count = int(document.size())
@@ -600,38 +702,10 @@ def extract_qgis_html_segments(text, text_format, base_font, base_color):
             if not fragment_text or character_format is None:
                 continue
 
-            font = QFont(base_font)
-            try:
-                family = character_format.family()
-                if family:
-                    font.setFamily(family)
-            except Exception:
-                record_suppressed_exception()
-            try:
-                point_size = float(character_format.fontPointSize())
-                percentage_size = float(
-                    character_format.fontPercentageSize())
-                if point_size > 0:
-                    font.setPointSizeF(point_size)
-                elif percentage_size > 0 and font.pointSizeF() > 0:
-                    font.setPointSizeF(
-                        font.pointSizeF() * percentage_size)
-            except Exception:
-                record_suppressed_exception()
-            try:
-                _set_weight(font, character_format.fontWeight())
-            except Exception:
-                record_suppressed_exception()
-            for getter, setter, inherited in (
-                    ("italic", "setItalic", font.italic()),
-                    ("underline", "setUnderline", font.underline()),
-                    ("strikeOut", "setStrikeOut", font.strikeOut()),
-                    ("overline", "setOverline", font.overline())):
-                try:
-                    value = getattr(character_format, getter)()
-                    getattr(font, setter)(_enum_override(value, inherited))
-                except Exception:
-                    record_suppressed_exception()
+            # QgsTextDocument returns QgsTextCharacterFormat, whose API is
+            # distinct from Qt's QTextCharFormat.  Start with the same
+            # canonical base font used by plain text and apply this QGIS run.
+            font = _qgis_inline_html_font(base_font, character_format)
             try:
                 spacing = float(character_format.wordSpacing())
                 if math.isfinite(spacing):

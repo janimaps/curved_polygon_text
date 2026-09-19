@@ -4,12 +4,14 @@ layout_item_polygon_text.py — Polygon Shaped Text Box layout item.
 
 
 import hashlib
+import re
 
 from qgis.core import (
     QgsLayoutItem, QgsLayoutItemRegistry, QgsReadWriteContext,
-    QgsTextFormat, QgsLayoutMeasurement, Qgis,
+    QgsTextFormat, QgsLayoutMeasurement, Qgis, QgsTextRenderer,
     QgsTextDocument, QgsTextDocumentMetrics, QgsTextBlock,
-    QgsTextFragment, QgsTextCharacterFormat,
+    QgsTextFragment, QgsTextCharacterFormat, QgsTextBlockFormat, QgsMargins,
+    QgsRenderContext,
 )
 
 from .compat import (
@@ -22,9 +24,17 @@ from .text_engine import (
     segments_to_plain_and_formats,
     polygon_scanline_spans, widest_span, point_segment_distance,
     render_font, strip_html, apply_capitalization, resolve_qgs_halign,
-    text_format_allows_html, segments_slice_to_html,
+    text_format_allows_html, segments_slice_to_html, text_format_base_font,
+    normalised_text_format_font,
 )
-from .icons import polygon_icon
+from .bezier import (
+    build_bezier_path, flatten_bezier, clone_handles, empty_handles, straight_handles,
+    bounded_polygon_handles, ensure_closed_handles,
+    handle_scene_records, nearest_segment, split_segment,
+    convert_segment_to_curve, convert_segment_to_straight,
+    serialise_handles, deserialise_handles, apply_node_mode,
+)
+from .icons import polygon_item_icon
 from .keep_alive import keep_alive
 from .reliability import record_suppressed_exception
 
@@ -285,6 +295,70 @@ def _format_size_map_unit_scale(text_format):
         return None
 
 
+class _CompositionUnitContext:
+    """Expose fixed composition-unit conversions to the polygon renderer."""
+
+    def __init__(self, source_context, destination_to_composition):
+        self._source_context = source_context
+        self._factor = float(destination_to_composition)
+
+    def convertToPainterUnits(self, *args):
+        return float(self._source_context.convertToPainterUnits(*args)) * self._factor
+
+
+def _render_pixels_unit():
+    """Resolve QGIS' pixel render unit across supported API generations."""
+    try:
+        from qgis.core import QgsUnitTypes
+        return QgsUnitTypes.RenderUnit.RenderPixels
+    except Exception:
+        try:
+            return Qgis.RenderUnit.Pixels
+        except Exception:
+            return None
+
+
+def _fixed_polygon_paint_format(text_format, render_ctx,
+                                composition_scale=16.0):
+    """Freeze a text format to composition-space pixels for final painting.
+
+    QgsTextRenderer normally resolves point/mm sizes against its live painter
+    context.  The polygon row plan is deliberately created at a fixed scale,
+    therefore final painting must use the equivalent fixed pixel size too.
+    The outer painter subsequently applies preview/export zoom as a transform.
+    """
+    try:
+        result = normalised_text_format_font(text_format)
+        font = text_format_base_font(result)
+        unit = _format_size_unit(result)
+        unit_scale = _format_size_map_unit_scale(result)
+        size_value = float(result.size())
+        display_scale = max(float(render_ctx.scaleFactor() or 1.0), 1.0e-9)
+        comp_context = _CompositionUnitContext(
+            render_ctx, float(composition_scale) / display_scale)
+        fixed_font = render_font(
+            font, composition_scale, comp_context, unit, unit_scale,
+            size_value)
+        try:
+            if unit_scale is not None:
+                size_px = float(comp_context.convertToPainterUnits(
+                    size_value, unit, unit_scale))
+            else:
+                size_px = float(comp_context.convertToPainterUnits(
+                    size_value, unit))
+        except Exception:
+            size_px = max(1.0, float(fixed_font.pointSizeF()) * 96.0 / 72.0)
+        fixed_font.setPixelSize(max(1, int(round(size_px))))
+        result.setFont(fixed_font)
+        pixel_unit = _render_pixels_unit()
+        if pixel_unit is not None:
+            result.setSizeUnit(pixel_unit)
+        result.setSize(max(1.0, size_px))
+        return result
+    except Exception:
+        return text_format
+
+
 def _convert_value_to_painter_units(render_ctx, value, unit=None,
                                     map_unit_scale=None, fallback_scale=1.0):
     try:
@@ -472,6 +546,33 @@ def _polygon_clip_path(qpoly):
     return path
 
 
+_HTML_SEMANTICS_RE = re.compile(
+    r"<\s*/?\s*[A-Za-z][A-Za-z0-9:_-]*(?:\s+[^<>]*?)?/?>"
+    r"|&(?:#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]+);"
+)
+
+
+def _has_html_semantics(value):
+    """Return whether an input needs a rich-document rendering path.
+
+    A mode toggle alone is not rich formatting.  Tags and character entities
+    change the text stream or its presentation and therefore remain on the
+    HTML path; ordinary text can use the exact plain-text compositor.
+    """
+    try:
+        return bool(_HTML_SEMANTICS_RE.search(str(value or "")))
+    except (TypeError, ValueError):
+        return True
+
+
+def _html_single_flow_text(value):
+    """Mirror Render-as-HTML's collapse of ordinary source whitespace."""
+    try:
+        return re.sub(r"[\t\n\r\f\v ]+", " ", str(value or ""))
+    except (TypeError, ValueError):
+        return str(value or "")
+
+
 def _frame_width_in_painter_units(item, scale_factor):
     """Return the native Layout Frame stroke width in painter units."""
     try:
@@ -485,13 +586,14 @@ def _frame_width_in_painter_units(item, scale_factor):
 
 
 
-def _line_safe_span(points, y_top, y_bottom, pad_px, hm_px, extra_x=0.0):
-    """Return the widest horizontal span that stays inside the polygon.
+def _line_safe_spans(points, y_top, y_bottom, pad_px, hm_px, extra_x=0.0):
+    """Return every horizontal interior span safe for the full line band.
 
-    The renderer samples several scanlines across the full painted line height
-    and intersects them to avoid choosing a span that is valid only at the
-    baseline but clips at ascenders/descenders.  The span is measured in the
-    same painter units as the supplied points.
+    A concave polygon can intersect one horizontal row in multiple disjoint
+    regions.  We retain all regions which stay inside the polygon throughout
+    the complete painted line height.  This allows one visual text row to flow
+    left-to-right through multiple lobes/columns instead of discarding all but
+    the widest lobe.
     """
     if y_bottom < y_top:
         y_top, y_bottom = y_bottom, y_top
@@ -501,7 +603,7 @@ def _line_safe_span(points, y_top, y_bottom, pad_px, hm_px, extra_x=0.0):
     y_top = max(bbox.top() + eps, y_top)
     y_bottom = min(bbox.bottom() - eps, y_bottom)
     if y_bottom < y_top:
-        return None
+        return []
 
     if y_bottom - y_top <= eps:
         sample_ys = [y_top]
@@ -512,12 +614,8 @@ def _line_safe_span(points, y_top, y_bottom, pad_px, hm_px, extra_x=0.0):
             for i in range(sample_count)
         ]
 
-        # A fixed set of scanlines can miss a polygon vertex between samples.
-        # That is normally hidden by the unused space on left/center/right
-        # aligned rows, but justified rows and their backgrounds occupy the
-        # complete calculated span.  Sample every vertex inside the painted
-        # band, plus a tiny point on either side, so the returned intersection
-        # reflects the true narrowest span throughout the row height.
+        # Include polygon vertices inside the row band so a narrow neck or
+        # lobe transition cannot be missed between the regular samples.
         vertex_eps = max(eps, (y_bottom - y_top) * 1.0e-6)
         for point in points:
             vertex_y = float(point.y())
@@ -539,23 +637,43 @@ def _line_safe_span(points, y_top, y_bottom, pad_px, hm_px, extra_x=0.0):
                 spans.append((left, right))
 
         if not spans:
-            return None
+            return []
 
         if current is None:
-            current = max(spans, key=lambda s: s[1] - s[0])
+            current = spans
             continue
 
         overlaps = []
-        for left, right in spans:
-            il = max(current[0], left)
-            ir = min(current[1], right)
-            if ir - il > 1.0:
-                overlaps.append((il, ir))
+        for cur_left, cur_right in current:
+            for left, right in spans:
+                il = max(cur_left, left)
+                ir = min(cur_right, right)
+                if ir - il > 1.0:
+                    overlaps.append((il, ir))
         if not overlaps:
-            return None
-        current = max(overlaps, key=lambda s: s[1] - s[0])
+            return []
 
-    return current
+        # Intersections can occasionally touch/duplicate at sampled vertices.
+        # Merge only truly overlapping intervals; keep genuine polygon gaps.
+        overlaps.sort(key=lambda span: span[0])
+        merged = []
+        for left, right in overlaps:
+            if merged and left <= merged[-1][1] + eps:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+            else:
+                merged.append((left, right))
+        current = merged
+
+    return sorted(current or [], key=lambda span: span[0])
+
+
+def _line_safe_span(points, y_top, y_bottom, pad_px, hm_px, extra_x=0.0):
+    """Backward-compatible helper returning the widest safe line span."""
+    spans = _line_safe_spans(
+        points, y_top, y_bottom, pad_px, hm_px, extra_x)
+    if not spans:
+        return None
+    return max(spans, key=lambda span: span[1] - span[0])
 
 def _copy_text_format_without_effects(text_format):
     """Clone the Text/Formatting tabs without the excluded effect tabs.
@@ -655,62 +773,301 @@ def _clip_safe_text_rect(lx, ly, lw, lh):
         except Exception:
             return None
 
-def _wrap_html_for_justify(html_text, plain_text, target_width_px, font,
-                           measured_width_px=None,
-                           css_spacing_factor=1.0,
-                           css_spacing_unit="px",
-                           edge_allowance_ratio=0.0):
-    """Wrap a line of HTML with CSS word-spacing so it visually justifies."""
-    try:
-        plain = (plain_text or "").strip()
-    except Exception:
-        plain = ""
-    if not plain or " " not in plain:
-        return html_text, False
+def _zero_horizontal_rich_document_margins(document):
+    """Return a copy of a rich text document with horizontal block margins removed."""
+    result = QgsTextDocument()
+    for block in document:
+        block_format = QgsTextBlockFormat(block.blockFormat())
+        margins = block_format.margins()
+        block_format.setMargins(
+            QgsMargins(0.0, margins.top(), 0.0, margins.bottom())
+        )
+        target_block = QgsTextBlock()
+        target_block.setBlockFormat(block_format)
+        for fragment in block:
+            target_block.append(fragment)
+        result.append(target_block)
+    return result
 
-    if measured_width_px is not None:
-        try:
-            base_width = float(measured_width_px)
-        except Exception:
-            return html_text, False
-    else:
-        try:
-            fm = QtGui.QFontMetricsF(font)
-            base_width = float(fm.horizontalAdvance(plain))
-        except Exception:
-            return html_text, False
 
-    # The target is already the safe scan-line span used by left and right
-    # alignment. Glyph overhang and antialiasing are accounted for when that
-    # span is composed, so justification must use the complete width here.
-    target_width = float(target_width_px)
-    edge_allowance = (
-        max(0.0, float(edge_allowance_ratio)) * target_width)
-    safe_target_width = max(0.0, target_width - edge_allowance)
-    extra = safe_target_width - base_width
-    if extra <= 0.5:
-        return html_text, False
+def _measure_rich_fragment_width(render_ctx, text_format, rich_fragment):
+    """Measure one rich fragment using QGIS' document metrics path used for painting.
 
-    gap_count = plain.count(" ")
-    if gap_count <= 0:
-        return html_text, False
-
-    word_spacing = max(0.0, extra / gap_count)
-    if word_spacing <= 0.01:
-        return html_text, False
+    The returned width is in painter units and is based on the same resolved
+    QgsTextDocument metrics pipeline used by the rich text renderer. Horizontal
+    block margins are removed because the geometric compositor owns the exact
+    placement of each fragment.
+    """
+    value = str(rich_fragment or "")
+    if not value:
+        return 0.0
 
     try:
-        css_word_spacing = word_spacing * float(css_spacing_factor)
+        measure_format = normalised_text_format_font(text_format)
     except Exception:
-        css_word_spacing = word_spacing
+        measure_format = text_format
 
-    wrapped = (
-        f'<div style="word-spacing:{css_word_spacing:.5f}{css_spacing_unit}; '
-        f'text-align:justify; white-space:pre-wrap;">'
-        f'{html_text}'
-        f'</div>'
+    try:
+        measure_format.setAllowHtmlFormatting(True)
+    except Exception:
+        record_suppressed_exception()
+
+    try:
+        measure_format.updateDataDefinedProperties(render_ctx)
+    except Exception:
+        record_suppressed_exception()
+
+    document = QgsTextDocument.fromTextAndFormat([value], measure_format)
+    document = _zero_horizontal_rich_document_margins(document)
+    scale_factor = QgsTextRenderer.calculateScaleFactorForFormat(
+        render_ctx, measure_format
     )
-    return wrapped, True
+    metrics = QgsTextDocumentMetrics.calculateMetrics(
+        document, measure_format, render_ctx, scale_factor
+    )
+
+    mode = getattr(getattr(Qgis, "TextLayoutMode", None), "Rectangle", None)
+    orientation = getattr(getattr(Qgis, "TextOrientation", None), "Horizontal", None)
+    if mode is None or orientation is None:
+        return 0.0
+
+    size = metrics.documentSize(mode, orientation)
+    return max(0.0, float(size.width()))
+
+
+def _preserve_html_spaces(rich_html):
+    """Replace literal spaces in HTML text nodes with non-breaking spaces.
+
+    Rich-document measurement must preserve source whitespace when a fragment
+    is measured independently from its neighbouring words.  Attribute values
+    (including font-family names) are left untouched.
+    """
+    value = str(rich_html or "")
+    if not value:
+        return value
+
+    def _replace(match):
+        return ">" + match.group(1).replace(" ", "\u00a0") + "<"
+
+    return re.sub(r">([^<>]*)<", _replace, value)
+
+
+def _rich_words_and_spaces(item, render_ctx, text_start, plain_line,
+                           text_format, segments, rich_content=True,
+                           base_font=None, base_color=None):
+    """Return QGIS-measured rich words and inter-word whitespace widths."""
+    line_text = str(plain_line or "")
+    matches = list(re.finditer(r"\S+", line_text))
+    if not matches:
+        return [], 0.0
+
+    segments = segments or []
+    # Render-as-HTML composes in fixed painter units. Its word fragments must
+    # use that same resolved QGIS base font, not Qt's implicit document font.
+    if base_font is None or base_color is None:
+        base_font = item._text_format.font()
+        base_color = item._text_format.color()
+    words = []
+    total_word_width = 0.0
+    total_space_width = 0.0
+    for index, match in enumerate(matches):
+        word_start = int(text_start) + match.start()
+        word_len = match.end() - match.start()
+        if rich_content:
+            word_html = segments_slice_to_html(
+                segments, word_start, word_len, base_font, base_color)
+            if not word_html:
+                word_html = _html_escape(match.group(0), quote=False)
+            word_width = _measure_rich_fragment_width(
+                render_ctx, text_format, word_html)
+        else:
+            word_html = match.group(0)
+            try:
+                word_width = float(QgsTextRenderer.textWidth(
+                    render_ctx, text_format, [word_html]))
+            except Exception:
+                word_width = 0.0
+        if word_width <= 0.0:
+            return [], 0.0
+
+        words.append((word_html, word_width))
+        total_word_width += word_width
+
+        if index + 1 < len(matches):
+            gap_text = line_text[match.end():matches[index + 1].start()]
+            if rich_content:
+                gap_html = segments_slice_to_html(
+                    segments, int(text_start) + match.end(), len(gap_text),
+                    base_font, base_color)
+                if not gap_html:
+                    gap_html = _html_escape(gap_text, quote=False)
+                gap_html = _preserve_html_spaces(gap_html)
+                gap_width = _measure_rich_fragment_width(
+                    render_ctx, text_format, gap_html) if gap_html else 0.0
+            else:
+                gap_html = gap_text
+                try:
+                    gap_width = float(QgsTextRenderer.textWidth(
+                        render_ctx, text_format, [gap_html])) if gap_html else 0.0
+                except Exception:
+                    gap_width = 0.0
+            total_space_width += max(0.0, float(gap_width))
+
+    return words, total_space_width
+
+
+def _compose_rich_line_commands(item, render_ctx, text_start, plain_line,
+                                row_x, row_y, row_width, text_format,
+                                segments, line_height, left_align,
+                                alignment, rich_content=True,
+                                base_font=None, base_color=None):
+    """Compose a rich-text line from independently measured word fragments.
+
+    The same compositor is used for left, center, right, and justify rich
+    text.  Words are measured through the exact QgsTextDocument metrics path
+    used to paint each fragment, avoiding a second line-level rich-document
+    wrapping/layout pass which can disagree with QTextLayout for condensed
+    fonts.
+    """
+    words, natural_space_width = _rich_words_and_spaces(
+        item, render_ctx, text_start, plain_line, text_format, segments,
+        rich_content=rich_content, base_font=base_font,
+        base_color=base_color)
+    if not words:
+        return None
+
+    available = max(0.0, float(row_width))
+    word_total = sum(width for _html, width in words)
+    justify = alignment == "justify" and len(words) >= 2
+
+    if justify:
+        remaining = available - word_total
+        tolerance = max(0.5, available * 0.001)
+        if remaining < -tolerance:
+            return None
+        gap = max(0.0, remaining / (len(words) - 1))
+        start_x = float(row_x)
+        gap_widths = [gap] * (len(words) - 1)
+    else:
+        natural_total = word_total + natural_space_width
+        if alignment == "right":
+            start_x = float(row_x) + max(0.0, available - natural_total)
+        elif alignment == "center":
+            start_x = float(row_x) + max(0.0, (available - natural_total) / 2.0)
+        else:
+            start_x = float(row_x)
+
+        if len(words) > 1:
+            line_text = str(plain_line or "")
+            matches = list(re.finditer(r"\S+", line_text))
+            gap_widths = []
+            if base_font is None or base_color is None:
+                base_font = item._text_format.font()
+                base_color = item._text_format.color()
+            segments = segments or []
+            for index in range(len(matches) - 1):
+                gap_text = line_text[
+                    matches[index].end():matches[index + 1].start()]
+                if rich_content:
+                    gap_html = segments_slice_to_html(
+                        segments, int(text_start) + matches[index].end(),
+                        len(gap_text), base_font, base_color)
+                    gap_html = _preserve_html_spaces(
+                        gap_html or _html_escape(gap_text, quote=False))
+                    if gap_html and not gap_html.strip():
+                        # HTML collapses a whitespace-only fragment to no visible
+                        # advance. Preserve the source whitespace explicitly so
+                        # non-justify rich text retains normal inter-word gaps.
+                        gap_html = "&nbsp;" * len(gap_text)
+                    try:
+                        gap_width = _measure_rich_fragment_width(
+                            render_ctx, text_format, gap_html) if gap_html else 0.0
+                    except Exception:
+                        gap_width = 0.0
+                else:
+                    try:
+                        gap_width = float(QgsTextRenderer.textWidth(
+                            render_ctx, text_format, [gap_text])) if gap_text else 0.0
+                    except Exception:
+                        gap_width = 0.0
+                gap_widths.append(max(0.0, float(gap_width)))
+        else:
+            gap_widths = []
+
+    commands = []
+    x = start_x
+    for index, (word_html, word_width) in enumerate(words):
+        commands.append({
+            "rect": (x, row_y, word_width, line_height),
+            "alignment": left_align,
+            "text": word_html,
+            "format": text_format,
+            "translate": (0.0, 0.0),
+            "scale": (1.0, 1.0),
+            "context_boost": 1.0,
+            "zero_horizontal_margins": True,
+        })
+        if index + 1 < len(words):
+            x += word_width + gap_widths[index]
+    return commands
+
+
+def _lock_rich_commands_to_row_advance(commands, origin_x, target_width):
+    """Apply the plain-text row transform to a sequence of rich fragments.
+
+    Plain polygon text is not aligned by asking the painter to re-evaluate an
+    alignment flag.  The compositor fixes a row's left origin from the
+    QTextLayout result, then applies one horizontal transform so the final
+    paint advance matches that row.  Rich text must do exactly the same: its
+    document fragments can have subtly different metrics, but they are still
+    parts of one already-aligned row.  Scaling each command about the shared
+    row origin retains inline formatting while keeping left/centre/right
+    geometrically identical to the normal-text path.
+
+    Justified rows deliberately do not call this helper.  Their individual
+    word positions already define the authoritative full-span layout.
+    """
+    if not commands:
+        return commands
+    try:
+        origin_x = float(origin_x)
+        target_width = float(target_width)
+        if target_width <= 0.0:
+            return commands
+        first_x = min(float(command["rect"][0]) for command in commands)
+        last_x = max(
+            float(command["rect"][0]) + float(command["rect"][2])
+            for command in commands)
+        natural_width = last_x - first_x
+        if natural_width <= 0.0:
+            return commands
+        scale = max(0.25, min(4.0, target_width / natural_width))
+        locked = []
+        for command in commands:
+            result = dict(command)
+            x, y, width, height = result["rect"]
+            # The fragment compositor starts non-justified lines at origin_x.
+            # Use first_x defensively so the transformation remains stable if
+            # a future rich-text feature introduces a leading run offset.
+            result["rect"] = (
+                (float(x) - first_x) / scale, y, width, height)
+            result["translate"] = (origin_x, 0.0)
+            result["scale"] = (scale, 1.0)
+            locked.append(result)
+        return locked
+    except (KeyError, TypeError, ValueError, IndexError):
+        return commands
+
+
+def _compose_justify_commands(item, render_ctx, text_start, plain_line,
+                              row_x, row_y, row_width, text_format,
+                              segments, line_height, left_align):
+    """Build the single authoritative Polygon Text justification layout."""
+    return _compose_rich_line_commands(
+        item, render_ctx, text_start, plain_line, row_x, row_y, row_width,
+        text_format, segments, line_height, left_align, "justify",
+        rich_content=False)
+
 
 
 class LayoutItemPolygonText(QgsLayoutItem):
@@ -744,16 +1101,27 @@ class LayoutItemPolygonText(QgsLayoutItem):
             QPointF(0.0, 0.0), QPointF(1.0, 0.0),
             QPointF(1.0, 1.0), QPointF(0.0, 1.0),
         ]
+        # v1.0.2: cubic Bezier handles are present on every polygon
+        # anchor. Their default collinear positions reproduce the original
+        # straight polygon exactly while making every edge immediately editable.
+        self._bezier_handles = bounded_polygon_handles(self._nodes)
         # Transient edit-state only.  This is deliberately not serialized.
         self._active_node_index = -1
+        self._active_handle = None
         # Transient cache for the layout plan.  The cache key excludes zoom so
         # line breaks stay pinned once composed.
         self._layout_cache_key = None
         self._layout_cache = None
+        # Keep a few immutable final paint plans so mode switches do not force
+        # a fresh advance/justification calculation for unchanged content.
+        self._frozen_paint_plans = {}
+        # One completed preview picture. It contains no scene or painter
+        # references and is replaced (not accumulated) when invalidated.
+        self._effect_preview_picture = None
 
     # ---------------------------------------------------------------- identity
     def type(self):        return POLYGON_TEXT_ITEM_TYPE
-    def icon(self):        return polygon_icon()
+    def icon(self):        return polygon_item_icon()
     def displayName(self): return "Polygon Text"
 
     def estimatedFrameBleed(self):
@@ -765,20 +1133,46 @@ class LayoutItemPolygonText(QgsLayoutItem):
         return max(inherited, 1.65)
 
     def boundingRect(self):
-        """Report the complete edit-handle area to QGraphicsScene.
+        """Report the item plus all editable Bezier geometry in the fixed frame.
 
-        QgsLayoutItem's C++ bounding rectangle can remain limited to rect()
-        for this custom Python item even when estimatedFrameBleed() is
-        overridden.  Explicitly uniting both rectangles prevents the scene's
-        system clip from cutting boundary-node circles in half.
+        Polygon node/handle coordinates are intentionally allowed outside the
+        item rect while editing.  The item rect is *not* used as a moving
+        normalisation frame, so crossing x=0/y=0 cannot reinterpret the closed
+        path.  Include anchors as well as controls so a node moved outside the
+        current rect remains inside the QGraphics bounding box.
         """
         try:
             bounds = QRectF(super().boundingRect())
         except Exception:
             bounds = QRectF(self.rect())
-        handle_bounds = QRectF(self.rect())
-        handle_bounds.adjust(-1.65, -1.65, 1.65, 1.65)
-        return bounds.united(handle_bounds)
+
+        rect = QRectF(self.rect())
+        geometry_bounds = QRectF(rect)
+        width = rect.width()
+        height = rect.height()
+        if width <= 0.0 or height <= 0.0:
+            geometry_bounds.adjust(-1.65, -1.65, 1.65, 1.65)
+            return bounds.united(geometry_bounds)
+
+        try:
+            for node in self._nodes:
+                geometry_bounds = geometry_bounds.united(
+                    QRectF(node.x() * width, node.y() * height, 0.0, 0.0))
+            handles = clone_handles(self._bezier_handles, len(self._nodes))
+            defaults = straight_handles(self._nodes, closed=True)
+            for i, rec in enumerate(handles):
+                for kind in ("in", "out"):
+                    hp = rec.get(kind)
+                    if hp is None and i < len(defaults):
+                        hp = defaults[i].get(kind)
+                    if hp is not None:
+                        geometry_bounds = geometry_bounds.united(
+                            QRectF(hp.x() * width, hp.y() * height, 0.0, 0.0))
+        except Exception:
+            record_suppressed_exception()
+
+        geometry_bounds.adjust(-1.65, -1.65, 1.65, 1.65)
+        return bounds.united(geometry_bounds)
 
     def shape(self):
         """Use the real polygon for initial selection.
@@ -789,42 +1183,21 @@ class LayoutItemPolygonText(QgsLayoutItem):
         if self.isSelected():
             return super().shape()
 
-        rect = self.rect()
-        points = QPolygonF([
-            QPointF(node.x() * rect.width(), node.y() * rect.height())
-            for node in self._nodes
-        ])
+        points, handles = self._local_bezier_geometry()
         if len(points) < 3:
             return super().shape()
-
-        path = QtGui.QPainterPath()
-        path.addPolygon(points)
-        path.closeSubpath()
-        return path
+        return build_bezier_path(points, handles, closed=True)
 
     def _request_selection_repaint(self):
-        """Clear complete node handles immediately after selection changes."""
+        """Request a normal item repaint after selection changes.
+
+        Calling ``QGraphicsScene.update()`` or a viewport update from within
+        ``itemChange(ItemSelectedChange)`` can recursively enter Qt's scene
+        foreground painting while a layout sketch is completing. ``update()``
+        is queued by QGraphicsItem and is sufficient to refresh node handles.
+        """
         try:
             self.update()
-        except Exception:
-            record_suppressed_exception()
-        try:
-            scene = self.scene()
-        except Exception:
-            scene = None
-        if scene is None:
-            return
-        try:
-            scene.update()
-        except Exception:
-            record_suppressed_exception()
-        try:
-            for view in scene.views():
-                view.viewport().update()
-        except Exception:
-            record_suppressed_exception()
-        try:
-            QtCore.QTimer.singleShot(0, scene.update)
         except Exception:
             record_suppressed_exception()
 
@@ -853,6 +1226,297 @@ class LayoutItemPolygonText(QgsLayoutItem):
     def activeNodeIndex(self):
         return self._active_node_index
 
+    def setActiveHandle(self, index=None, kind=None):
+        value = None
+        if index is not None and kind in ("in", "out") and 0 <= int(index) < len(self._nodes):
+            value = (int(index), kind)
+        if value != self._active_handle:
+            self._active_handle = value
+            self.update()
+
+    def activeHandle(self):
+        return self._active_handle
+
+    def _local_bezier_geometry(self):
+        rect = self.rect()
+        points = [QPointF(n.x() * rect.width(), n.y() * rect.height()) for n in self._nodes]
+        handles = clone_handles(self._bezier_handles, len(self._nodes))
+        # Do not mutate live geometry during paint.  Legacy files may lack a
+        # control, but the rendering fallback is a local copy only.
+        defaults = straight_handles(self._nodes, closed=True)
+        for i, rec in enumerate(handles):
+            for kind in ("in", "out"):
+                pt = rec.get(kind)
+                if pt is None and i < len(defaults):
+                    pt = defaults[i].get(kind)
+                if pt is not None:
+                    rec[kind] = QPointF(pt.x() * rect.width(), pt.y() * rect.height())
+        return points, handles
+
+    def handleScenePositions(self):
+        handles = clone_handles(self._bezier_handles, len(self._nodes))
+        defaults = straight_handles(self._nodes, closed=True)
+        for i, rec in enumerate(handles):
+            for kind in ("in", "out"):
+                if rec.get(kind) is None and i < len(defaults):
+                    rec[kind] = defaults[i].get(kind)
+        return handle_scene_records(self, self._nodes, handles)
+
+    def nodeMode(self, index):
+        if 0 <= index < len(self._bezier_handles):
+            return self._bezier_handles[index].get("mode", "corner")
+        return "corner"
+
+    def _refresh_bezier_geometry_bounds(self):
+        """Refresh painting and QGraphics bounds without changing the frame.
+
+        The polygon's editable geometry lives in one stable local coordinate
+        frame.  QGraphics derives its paint bounds from :meth:`boundingRect`, so
+        changing a handle/node only requires a geometry-change notification and
+        repaint; there is no reason to rewrite every node against a new rect.
+        """
+        old_rect = None
+        try:
+            old_rect = QRectF(self.sceneBoundingRect())
+            old_rect.adjust(-6.0, -6.0, 6.0, 6.0)
+        except (RuntimeError, TypeError):
+            old_rect = None
+        try:
+            self.prepareGeometryChange()
+        except (AttributeError, RuntimeError):
+            record_suppressed_exception()
+        self._layout_cache_key = None
+        self._layout_cache = None
+        self.update()
+        try:
+            scene = self.scene()
+        except RuntimeError:
+            scene = None
+        if scene is not None:
+            try:
+                new_rect = QRectF(self.sceneBoundingRect())
+                new_rect.adjust(-6.0, -6.0, 6.0, 6.0)
+            except (RuntimeError, TypeError):
+                new_rect = None
+            dirty = None
+            for candidate in (old_rect, new_rect):
+                if candidate is not None and candidate.isValid() and not candidate.isNull():
+                    dirty = QRectF(candidate) if dirty is None else dirty.united(candidate)
+            try:
+                scene.update(dirty) if dirty is not None else scene.update()
+            except RuntimeError:
+                record_suppressed_exception()
+            try:
+                for view in scene.views():
+                    view.viewport().update()
+            except RuntimeError:
+                record_suppressed_exception()
+
+    def setNodeMode(self, index, mode):
+        if not (0 <= index < len(self._nodes)) or mode not in ("corner", "smooth", "symmetric"):
+            return False
+        self._bezier_handles = ensure_closed_handles(
+            self._nodes, self._bezier_handles)
+        self._bezier_handles, changed = apply_node_mode(
+            self._nodes, self._bezier_handles, index, mode, closed=True)
+        if not changed:
+            return False
+        self._tighten_geometry_frame()
+        return True
+
+    def resetNodeHandles(self, index):
+        if not (0 <= index < len(self._nodes)):
+            return False
+        self._bezier_handles = ensure_closed_handles(
+            self._nodes, self._bezier_handles)
+        defaults = bounded_polygon_handles(self._nodes)
+        self._bezier_handles[index]["in"] = defaults[index]["in"]
+        self._bezier_handles[index]["out"] = defaults[index]["out"]
+        self._bezier_handles[index]["mode"] = "corner"
+        self._tighten_geometry_frame()
+        return True
+
+    def nearestBezierSegment(self, scene_pos):
+        local = self.mapFromScene(scene_pos)
+        points, handles = self._local_bezier_geometry()
+        return nearest_segment(local, points, handles, closed=True)
+
+    def convertSegmentToCurve(self, index):
+        self._bezier_handles = convert_segment_to_curve(
+            self._nodes, self._bezier_handles, index, closed=True)
+        bounded = bounded_polygon_handles(self._nodes)
+        if 0 <= index < len(self._nodes):
+            j = (index + 1) % len(self._nodes)
+            # Only constrain the newly-created controls. Existing custom
+            # controls are preserved exactly.
+            if self._bezier_handles[index].get("mode", "corner") == "corner":
+                self._bezier_handles[index]["out"] = bounded[index]["out"]
+            if self._bezier_handles[j].get("mode", "corner") == "corner":
+                self._bezier_handles[j]["in"] = bounded[j]["in"]
+        self._layout_cache_key = None
+        self._layout_cache = None
+        self._tighten_geometry_frame()
+        return True
+
+    def convertSegmentToStraight(self, index):
+        if not (0 <= index < len(self._nodes)):
+            return False
+        self._bezier_handles = ensure_closed_handles(
+            self._nodes, self._bezier_handles)
+        j = (index + 1) % len(self._nodes)
+        a, b = self._nodes[index], self._nodes[j]
+        self._bezier_handles[index]["out"] = QPointF(
+            a.x() + (b.x() - a.x()) / 3.0,
+            a.y() + (b.y() - a.y()) / 3.0)
+        self._bezier_handles[j]["in"] = QPointF(
+            a.x() + 2.0 * (b.x() - a.x()) / 3.0,
+            a.y() + 2.0 * (b.y() - a.y()) / 3.0)
+        self._layout_cache_key = None
+        self._layout_cache = None
+        self._tighten_geometry_frame()
+        return True
+
+    def _scene_geometry(self):
+        anchors = self.nodeScenePositions()
+        handle_map = {(i, kind): pt for i, kind, pt in self.handleScenePositions()}
+        return anchors, handle_map
+
+    def _apply_scene_geometry(self, anchors, handle_map):
+        """Resize the QGIS item while preserving every Bezier point in scene space."""
+        all_points = list(anchors) + list(handle_map.values())
+        if not all_points:
+            return
+
+        xs = [p.x() for p in all_points]
+        ys = [p.y() for p in all_points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        # This is the reference build's fixed edit margin. It keeps the
+        # visual node/handle affordances inside the QGraphics bounds without
+        # accumulating unused space as the shape is edited.
+        edit_margin = 1.75
+        min_x -= edit_margin
+        min_y -= edit_margin
+        max_x += edit_margin
+        max_y += edit_margin
+        new_w = max(max_x - min_x, 5.0)
+        new_h = max(max_y - min_y, 5.0)
+
+        old_rect = QRectF(self.sceneBoundingRect())
+        target_rect = QRectF(min_x, min_y, new_w, new_h)
+        try:
+            self.attemptSetSceneRect(target_rect)
+        except Exception:
+            record_suppressed_exception()
+            return
+
+        # The snapshot, not derived controls or node modes, is authoritative
+        # after the frame change. Thus the closed seam cannot be recalculated
+        # differently from any other segment.
+        local_rect = QRectF(self.rect())
+        if local_rect.width() <= 0.0 or local_rect.height() <= 0.0:
+            return
+        nodes = []
+        for point in anchors:
+            local = self.mapFromScene(point)
+            nodes.append(QPointF(
+                local.x() / local_rect.width(),
+                local.y() / local_rect.height()))
+
+        hs = clone_handles(self._bezier_handles, len(nodes))
+        for i, rec in enumerate(hs):
+            for kind in ("in", "out"):
+                scene_handle = handle_map.get((i, kind))
+                if scene_handle is None:
+                    rec[kind] = None
+                    continue
+                local = self.mapFromScene(scene_handle)
+                rec[kind] = QPointF(
+                    local.x() / local_rect.width(),
+                    local.y() / local_rect.height())
+        self._nodes = nodes
+        self._bezier_handles = hs
+        self._layout_cache_key = None
+        self._layout_cache = None
+
+        try:
+            new_rect = QRectF(self.sceneBoundingRect())
+            dirty = old_rect.united(new_rect)
+            self.scene().update(dirty) if self.scene() is not None else self.update()
+        except (AttributeError, RuntimeError):
+            record_suppressed_exception()
+
+    def _tighten_geometry_frame(self):
+        """Fit the item to nodes and handles from an invariant scene snapshot."""
+        try:
+            anchors = self.nodeScenePositions()
+            handle_map = {
+                (i, kind): point
+                for i, kind, point in self.handleScenePositions()
+            }
+        except (AttributeError, RuntimeError):
+            record_suppressed_exception()
+            return
+        if len(anchors) < 3:
+            return
+        self._apply_scene_geometry(anchors, handle_map)
+        self._refresh_bezier_geometry_bounds()
+
+    def setBezierHandleAtScenePos(self, index, kind, scene_pos, independent=False, constrain=False):
+        if not (0 <= index < len(self._nodes)) or kind not in ("in", "out"):
+            return
+
+        rect = QRectF(self.rect())
+        if rect.width() <= 0.0 or rect.height() <= 0.0:
+            return
+
+        anchors, handle_map = self._scene_geometry()
+        anchor = anchors[index]
+        target = QPointF(scene_pos)
+        if constrain:
+            dx, dy = target.x() - anchor.x(), target.y() - anchor.y()
+            radius = (dx * dx + dy * dy) ** 0.5
+            if radius > 0:
+                import math
+                step = math.pi / 12.0
+                angle = round(math.atan2(dy, dx) / step) * step
+                target = QPointF(anchor.x() + math.cos(angle) * radius,
+                                 anchor.y() + math.sin(angle) * radius)
+
+        mode = self.nodeMode(index)
+        opposite = "out" if kind == "in" else "in"
+        handle_map[(index, kind)] = target
+        if not independent and mode in ("smooth", "symmetric"):
+            old_other = handle_map.get((index, opposite))
+            vx, vy = target.x() - anchor.x(), target.y() - anchor.y()
+            length = (vx * vx + vy * vy) ** 0.5
+            if length > 1e-9:
+                if mode == "symmetric" or old_other is None:
+                    other_len = length
+                else:
+                    other_len = ((old_other.x() - anchor.x()) ** 2 +
+                                 (old_other.y() - anchor.y()) ** 2) ** 0.5
+                handle_map[(index, opposite)] = QPointF(
+                    anchor.x() - vx / length * other_len,
+                    anchor.y() - vy / length * other_len)
+
+        try:
+            self.prepareGeometryChange()
+        except (AttributeError, RuntimeError):
+            record_suppressed_exception()
+
+        local_handles = clone_handles(self._bezier_handles, len(self._nodes))
+        for handle_kind in (kind, opposite):
+            scene_handle = handle_map.get((index, handle_kind))
+            if scene_handle is None:
+                continue
+            local = self.mapFromScene(scene_handle)
+            local_handles[index][handle_kind] = QPointF(
+                local.x() / rect.width(), local.y() / rect.height())
+        self._bezier_handles = local_handles
+        self._tighten_geometry_frame()
+
     def nodeScenePositions(self):
         rect = self.rect()
         return [
@@ -861,77 +1525,86 @@ class LayoutItemPolygonText(QgsLayoutItem):
         ]
 
     def setNodeAtScenePos(self, index, scene_pos):
+        """Move one anchor and keep the item frame tight to its geometry."""
         if not (0 <= index < len(self._nodes)):
             return
-        # Get ALL nodes in scene coordinates, update the dragged one.
-        all_scene = self.nodeScenePositions()
-        all_scene[index] = scene_pos
-        # Compute the bounding rect of all new scene positions.
-        xs = [p.x() for p in all_scene]
-        ys = [p.y() for p in all_scene]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        new_w = max(max_x - min_x, 5.0)   # 5 mm minimum
-        new_h = max(max_y - min_y, 5.0)
-        # Resize the item to fit the new node positions.
-        self.attemptSetSceneRect(QRectF(min_x, min_y, new_w, new_h))
-        # Compute normalised fractions directly from the requested bounds
-        # (not from self.rect(), which may not yet reflect the resize).
-        self._nodes = [
-            QPointF(
-                min(max((p.x() - min_x) / new_w, 0.0), 1.0),
-                min(max((p.y() - min_y) / new_h, 0.0), 1.0),
-            )
-            for p in all_scene
-        ]
-        self.update()
+        rect = QRectF(self.rect())
+        if rect.width() <= 0.0 or rect.height() <= 0.0:
+            return
+
+        try:
+            self.prepareGeometryChange()
+        except (AttributeError, RuntimeError):
+            record_suppressed_exception()
+
+        local = self.mapFromScene(QPointF(scene_pos))
+        dx_norm = local.x() / rect.width() - self._nodes[index].x()
+        dy_norm = local.y() / rect.height() - self._nodes[index].y()
+        self._nodes[index] = QPointF(
+            local.x() / rect.width(), local.y() / rect.height())
+
+        # Move this node's own handles with the anchor in the current frame.
+        rec = self._bezier_handles[index] if index < len(self._bezier_handles) else None
+        if isinstance(rec, dict):
+            for kind in ("in", "out"):
+                handle = rec.get(kind)
+                if handle is not None:
+                    rec[kind] = QPointF(
+                        handle.x() + dx_norm, handle.y() + dy_norm)
+
+        self._tighten_geometry_frame()
 
     def insertNodeNearestEdge(self, scene_pos):
         rect = self.rect()
         if rect.width() <= 0 or rect.height() <= 0:
             return
         local = self.mapFromScene(scene_pos)
-        new_pt = QPointF(
-            min(max(local.x()/rect.width(),  0.0), 1.0),
-            min(max(local.y()/rect.height(), 0.0), 1.0),
-        )
-        n = len(self._nodes)
-        best_i, best_d = 1, None
-        for i in range(n):
-            d = point_segment_distance(
-                new_pt, self._nodes[i], self._nodes[(i+1) % n])
-            if best_d is None or d < best_d:
-                best_d, best_i = d, i+1
-        self._nodes.insert(best_i % (n+1), new_pt)
-        self.update()
+        norm_local = QPointF(local.x() / rect.width(), local.y() / rect.height())
+        seg_index, t, _nearest, _distance = nearest_segment(
+            norm_local, self._nodes, self._bezier_handles, closed=True)
+        if seg_index < 0:
+            return
+        self._nodes, self._bezier_handles, _new_index = split_segment(
+            self._nodes, self._bezier_handles, seg_index, t, closed=True)
+        self._layout_cache_key = None
+        self._layout_cache = None
+        self._tighten_geometry_frame()
 
     def removeNodeAt(self, index):
-        if len(self._nodes) <= 3:
+        if len(self._nodes) <= 3 or not (0 <= index < len(self._nodes)):
             return False
-        if 0 <= index < len(self._nodes):
-            # Work in scene coordinates so shrinking the item extent cannot
-            # move or rescale any of the surviving polygon vertices.
-            remaining_scene = self.nodeScenePositions()
-            del remaining_scene[index]
-
-            xs = [point.x() for point in remaining_scene]
-            ys = [point.y() for point in remaining_scene]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            new_w = max(max_x - min_x, 5.0)
-            new_h = max(max_y - min_y, 5.0)
-
-            self.attemptSetSceneRect(QRectF(min_x, min_y, new_w, new_h))
+        anchors, handle_map = self._scene_geometry()
+        del anchors[index]
+        new_map = {}
+        for (i, kind), pt in handle_map.items():
+            if i == index:
+                continue
+            new_i = i - 1 if i > index else i
+            new_map[(new_i, kind)] = pt
+        hs = clone_handles(self._bezier_handles, len(self._nodes))
+        del hs[index]
+        new_hs = clone_handles(hs, len(anchors))
+        for (i, kind), pt in new_map.items():
+            if 0 <= i < len(new_hs):
+                local = self.mapFromScene(pt)
+                rect = QRectF(self.rect())
+                if rect.width() > 0.0 and rect.height() > 0.0:
+                    new_hs[i][kind] = QPointF(
+                        local.x() / rect.width(), local.y() / rect.height())
+        self._bezier_handles = new_hs
+        rect = QRectF(self.rect())
+        if rect.width() > 0.0 and rect.height() > 0.0:
             self._nodes = [
                 QPointF(
-                    min(max((point.x() - min_x) / new_w, 0.0), 1.0),
-                    min(max((point.y() - min_y) / new_h, 0.0), 1.0),
-                )
-                for point in remaining_scene
+                    self.mapFromScene(p).x() / rect.width(),
+                    self.mapFromScene(p).y() / rect.height(),
+                ) for p in anchors
             ]
-            self._request_selection_repaint()
-            return True
-        return False
+        self._layout_cache_key = None
+        self._layout_cache = None
+        self._tighten_geometry_frame()
+        self._request_selection_repaint()
+        return True
 
     def setNodesFromScenePoints(self, scene_points):
         rect = self.rect()
@@ -946,6 +1619,9 @@ class LayoutItemPolygonText(QgsLayoutItem):
             ))
         if len(nodes) >= 3:
             self._nodes = nodes
+            self._bezier_handles = bounded_polygon_handles(self._nodes)
+            self._layout_cache_key = None
+            self._layout_cache = None
             self.update()
 
     def setNodesFromSceneBounds(self, scene_points, scene_rect):
@@ -959,6 +1635,9 @@ class LayoutItemPolygonText(QgsLayoutItem):
             ))
         if len(nodes) >= 3:
             self._nodes = nodes
+            self._bezier_handles = bounded_polygon_handles(self._nodes)
+            self._layout_cache_key = None
+            self._layout_cache = None
             self.update()
 
     # --------------------------------------------------------- properties
@@ -1003,27 +1682,77 @@ class LayoutItemPolygonText(QgsLayoutItem):
 
     def _base_font_and_color(self):
         """Return (QFont with point size, QColor) from the stored text format."""
-        f = QFont(self._text_format.font())
-        size = self._text_format.size()
-        if size > 0:
-            f.setPointSizeF(size)
-        elif f.pointSizeF() <= 0 and f.pixelSize() <= 0:
-            f.setPointSizeF(10.0)
+        return text_format_base_font(self._text_format), QColor(self._text_format.color())
+
+    def _has_picture_cacheable_effect(self):
+        """Return whether a preview effect benefits from QPicture replay."""
         try:
-            if self._text_format.forcedBold():
-                f.setBold(True)
+            # QGIS buffers are stroked glyph geometry. Recording those paths
+            # is slower than the native direct buffer renderer.
+            if self._text_format.buffer().enabled():
+                return False
         except Exception:
             record_suppressed_exception()
+        settings = [self._text_format]
+        for name in ("background", "shadow"):
+            try:
+                component = getattr(self._text_format, name)()
+                settings.append(component)
+                if component.enabled():
+                    return True
+            except Exception:
+                record_suppressed_exception()
+        for owner in settings:
+            for getter_name in (
+                    "paintEffect", "paintEffectStack", "effect",
+                    "effectStack", "drawEffect", "drawEffects"):
+                try:
+                    effect = getattr(owner, getter_name)()
+                    if effect is not None and bool(effect.enabled()):
+                        return True
+                except AttributeError:
+                    continue
+                except Exception:
+                    record_suppressed_exception()
+        return False
+
+    def _effect_preview_picture_key(self, resolved_text):
+        """Return a conservative, zoom-independent preview cache key."""
         try:
-            if self._text_format.forcedItalic():
-                f.setItalic(True)
+            inline_html = text_format_allows_html(self._text_format)
+        except Exception:
+            inline_html = False
+        return (
+            "effect-picture-isolated-v1",
+            self._layout_signature(
+                resolved_text, self._allow_html, inline_html),
+            self._text_format_revision,
+        )
+
+    def _disable_preview_item_cache(self):
+        """Disable Qt item caching for QGIS' transformed layout painter."""
+        owner = QtWidgets.QGraphicsItem
+        scoped = getattr(owner, "CacheMode", None)
+        no_cache = getattr(scoped, "NoCache", None)
+        if no_cache is None:
+            no_cache = getattr(owner, "NoCache", None)
+        if no_cache is None:
+            return
+        try:
+            if self.cacheMode() == no_cache:
+                return
+            # QGIS applies its own layout-unit/preview transform. Qt's item
+            # coordinate cache replays it as a second transform and can move
+            # polygon content, so use only the explicit text-picture cache.
+            self.setCacheMode(no_cache)
         except Exception:
             record_suppressed_exception()
-        return f, QColor(self._text_format.color())
 
 
 
-    def _layout_signature(self, resolved_text, render_html=False, inline_html=False):
+    def _layout_signature(self, resolved_text, render_html=False,
+                          inline_html=False, render_html_plain=False,
+                          plain_compatible=False):
         """Build a zoom-independent signature for the current polygon text plan."""
         rect = self.rect()
 
@@ -1034,14 +1763,48 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 return 0.0
 
         nodes_sig = tuple((_safe_float(n.x(), 6), _safe_float(n.y(), 6)) for n in self._nodes)
+        bezier_sig = serialise_handles(self._bezier_handles)
         text_sig = hashlib.blake2b(
             (resolved_text or "").encode("utf-8"),
             digest_size=16).digest()
 
+        if plain_compatible:
+            # The native Allow HTML flag changes QgsTextFormat's revision even
+            # when there are no tags to render. Key compatible text by the
+            # actual font/layout properties instead, so its frozen plan can be
+            # reused across all three mode toggles.
+            font, _color = self._base_font_and_color()
+            try:
+                font_sig = font.toString()
+            except Exception:
+                font_sig = repr(font)
+            try:
+                size_unit = str(self._text_format.sizeUnit())
+            except Exception:
+                size_unit = ""
+            try:
+                line_height = float(self._text_format.lineHeight())
+            except Exception:
+                line_height = 1.0
+            try:
+                capitalization = str(self._text_format.capitalization())
+            except Exception:
+                capitalization = ""
+            return (
+                "plain_compatible", _safe_float(rect.width(), 6),
+                _safe_float(rect.height(), 6), nodes_sig, bezier_sig, text_sig,
+                font_sig, _safe_float(self._text_format.size(), 6), size_unit,
+                _safe_float(line_height, 6), capitalization,
+                int(self._h_align), int(self._v_align),
+                _safe_float(self._padding, 6),
+                _safe_float(self._h_margin, 6),
+                _safe_float(self._v_margin, 6),
+            )
+
         if render_html:
             return (
                 "render_html", _safe_float(rect.width(), 6),
-                _safe_float(rect.height(), 6), nodes_sig, text_sig,
+                _safe_float(rect.height(), 6), nodes_sig, bezier_sig, text_sig,
                 int(self._h_align), int(self._v_align),
                 _safe_float(self._padding, 6),
                 _safe_float(self._h_margin, 6),
@@ -1053,9 +1816,11 @@ class LayoutItemPolygonText(QgsLayoutItem):
             _safe_float(rect.width(), 6),
             _safe_float(rect.height(), 6),
             nodes_sig,
+            bezier_sig,
             text_sig,
             bool(render_html),
             bool(inline_html),
+            bool(render_html_plain),
             int(self._h_align),
             int(self._v_align),
             _safe_float(self._padding, 6),
@@ -1080,21 +1845,32 @@ class LayoutItemPolygonText(QgsLayoutItem):
         scale_factor = context.renderContext().scaleFactor() or 1.0
         render_ctx   = context.renderContext()
         is_preview_render = _is_layout_preview_render(self)
+        # Do not mutate QGraphicsItem cache state from inside draw().
+        # QGIS/Qt may be traversing the scene's paint/cache machinery at this
+        # point; v1.0.1 left the item cache state untouched during painting.
         painter.save()
         try:
             painter.setRenderHint(AA_ANTIALIASING, True)
             painter.setRenderHint(AA_TEXT_ANTIALIASING, True)
 
             rect = self.rect()
-            poly_layout = [
-                QPointF(n.x() * rect.width(), n.y() * rect.height())
-                for n in self._nodes
-            ]
-            poly_px = [
-                QPointF(p.x() * scale_factor, p.y() * scale_factor)
-                for p in poly_layout
-            ]
+            anchor_layout, handle_layout = self._local_bezier_geometry()
+            # The text wrapping engine works on a polygon. Curved boundaries
+            # are adaptively flattened at sub-millimetre tolerance, while the
+            # editable geometry remains exact cubic Bezier data.
+            poly_layout = flatten_bezier(
+                anchor_layout, handle_layout, closed=True, tolerance=0.15)
+            poly_px = [QPointF(p.x() * scale_factor, p.y() * scale_factor)
+                       for p in poly_layout]
             qpoly  = QPolygonF(poly_px)
+            anchor_px = [QPointF(p.x() * scale_factor, p.y() * scale_factor)
+                         for p in anchor_layout]
+            handle_px = clone_handles(handle_layout, len(anchor_layout))
+            for rec in handle_px:
+                for kind in ("in", "out"):
+                    hp = rec.get(kind)
+                    if hp is not None:
+                        rec[kind] = QPointF(hp.x() * scale_factor, hp.y() * scale_factor)
             # Stored values are layout millimetres; convert them to the same
             # painter coordinate system as the zoom-scaled polygon.
             pad_px = self._padding * scale_factor
@@ -1127,6 +1903,15 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 painter.setPen(pen)
                 painter.setBrush(QBrush(NO_BRUSH))
                 painter.drawPolygon(qpoly)
+            elif is_preview_render and self.isSelected():
+                # Keep the editable polygon boundary visible even when the
+                # user has disabled the exported/printed frame.  This is an
+                # edit-only guide: it deliberately ignores any stored custom
+                # frame colour/width while the frame is disabled.
+                guide_pen = QPen(QColor(150, 150, 150), 0.20 * scale_factor)
+                painter.setPen(guide_pen)
+                painter.setBrush(QBrush(NO_BRUSH))
+                painter.drawPolygon(qpoly)
 
             painter.save()
             try:
@@ -1134,9 +1919,20 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 resolved = evaluate_expressions(self._text, self)
                 if resolved.strip():
                     previous_text_render_format = None
+                    previous_render_context_scale = None
                     outline_format = None
                     try:
                         previous_text_render_format = render_ctx.textRenderFormat()
+                    except Exception:
+                        record_suppressed_exception()
+                    try:
+                        # Rich polygon composition temporarily replaces this
+                        # shared QGIS context value with its fixed metric scale.
+                        # Keep the entry value here so every paint exit,
+                        # including an interrupted HTML/justify draw, restores
+                        # the context observed by the next layout item.
+                        previous_render_context_scale = float(
+                            render_ctx.scaleFactor())
                     except Exception:
                         record_suppressed_exception()
                     try:
@@ -1147,9 +1943,81 @@ class LayoutItemPolygonText(QgsLayoutItem):
                             outline_format = getattr(Qgis, "TextFormatAlwaysOutlines", None)
                         if outline_format is not None:
                             render_ctx.setTextRenderFormat(outline_format)
-                        self._draw_wrapped_text(
-                            render_ctx, poly_px, resolved,
-                            pad_px, hm_px, vm_px, scale_factor)
+                        # QPicture replay is deliberately disabled. Even with
+                        # a cloned QgsRenderContext, recording Qt/QGIS paint
+                        # effects during an active Layout scene paint has
+                        # caused native access violations on QGIS 4 / Qt 6.
+                        # Direct rendering is the supported, stable path.
+                        picture_key = None
+                        cached_picture = None
+                        if picture_key is not None:
+                            try:
+                                cached = self._effect_preview_picture
+                                if cached is not None and cached[0] == picture_key:
+                                    cached_picture = cached[1]
+                            except Exception:
+                                record_suppressed_exception()
+                        if cached_picture is not None:
+                            painter.save()
+                            try:
+                                painter.scale(scale_factor, scale_factor)
+                                painter.drawPicture(0, 0, cached_picture)
+                            finally:
+                                painter.restore()
+                        elif picture_key is None:
+                            self._draw_wrapped_text(
+                                render_ctx, poly_px, resolved,
+                                pad_px, hm_px, vm_px, scale_factor)
+                        else:
+                            # Record through a *cloned* render context. The
+                            # live layout context is never given another
+                            # painter, which is the unsafe v1.0.34 behaviour.
+                            picture = QtGui.QPicture()
+                            recording_painter = QtGui.QPainter(picture)
+                            recorded = False
+                            isolated_context = None
+                            try:
+                                isolated_context = QgsRenderContext(render_ctx)
+                                isolated_context.setPainter(recording_painter)
+                                recording_painter.setClipPath(
+                                    _polygon_clip_path(QPolygonF(poly_layout)))
+                                self._draw_wrapped_text(
+                                    isolated_context, poly_layout, resolved,
+                                    self._padding, self._h_margin,
+                                    self._v_margin, 1.0)
+                                recorded = True
+                            except Exception:
+                                record_suppressed_exception()
+                            finally:
+                                # End before retaining the picture. The cloned
+                                # context and its temporary painter are then
+                                # discarded together, without touching the
+                                # live QGIS render context.
+                                try:
+                                    recording_painter.end()
+                                except Exception:
+                                    record_suppressed_exception()
+                                isolated_context = None
+                            if recorded:
+                                painter.save()
+                                try:
+                                    painter.scale(scale_factor, scale_factor)
+                                    painter.drawPicture(0, 0, picture)
+                                finally:
+                                    painter.restore()
+                                try:
+                                    bounds = picture.boundingRect()
+                                    pixels = max(0, bounds.width()) * max(
+                                        0, bounds.height())
+                                    if pixels <= 24_000_000:
+                                        self._effect_preview_picture = (
+                                            picture_key, picture)
+                                except Exception:
+                                    record_suppressed_exception()
+                            else:
+                                self._draw_wrapped_text(
+                                    render_ctx, poly_px, resolved,
+                                    pad_px, hm_px, vm_px, scale_factor)
                     finally:
                         if previous_text_render_format is not None:
                             try:
@@ -1157,39 +2025,69 @@ class LayoutItemPolygonText(QgsLayoutItem):
                                     previous_text_render_format)
                             except Exception:
                                 record_suppressed_exception()
+                        if previous_render_context_scale is not None:
+                            try:
+                                render_ctx.setScaleFactor(
+                                    previous_render_context_scale)
+                            except Exception:
+                                record_suppressed_exception()
             finally:
                 painter.restore()
 
             if is_preview_render and self.isSelected():
-                # QgsLayoutItem supplies a clip matching rect(), which cuts
-                # boundary-node circles in half even though frame bleed makes
-                # their paint bounds visible to the scene.  Lift that clip
-                # only for these edit-time handles; polygon/text clipping has
-                # already completed above and exports never draw the handles.
                 painter.save()
                 try:
                     painter.setClipping(False)
-                    normal_pen = QPen(
-                        QColor(40, 140, 90), 0.25 * scale_factor)
-                    active_pen = QPen(
-                        QColor(190, 85, 0), 0.35 * scale_factor)
-                    normal_brush = QColor(255, 255, 255)
-                    active_brush = QColor(255, 170, 45)
-                    r = 1.4 * scale_factor
-                    active_r = 1.7 * scale_factor
-                    for index, pt in enumerate(poly_px):
-                        if index == self._active_node_index:
-                            painter.setPen(active_pen)
-                            painter.setBrush(active_brush)
-                            painter.drawEllipse(pt, active_r, active_r)
-                        else:
-                            painter.setPen(normal_pen)
-                            painter.setBrush(normal_brush)
-                            painter.drawEllipse(pt, r, r)
+                    self._draw_bezier_handles(
+                        painter, anchor_px, handle_px, scale_factor)
                 finally:
                     painter.restore()
+
         finally:
             painter.restore()
+
+    def _draw_bezier_handles(self, painter, anchors_px, handles_px, scale_factor):
+        normal_pen = QPen(QColor(40, 140, 90), 0.25 * scale_factor)
+        active_pen = QPen(QColor(190, 85, 0), 0.35 * scale_factor)
+        arm_pen = QPen(QColor(95, 140, 115), 0.20 * scale_factor)
+        handle_pen = QPen(QColor(55, 125, 95), 0.22 * scale_factor)
+        active_handle_pen = QPen(QColor(190, 85, 0), 0.32 * scale_factor)
+        normal_brush = QColor(255, 255, 255)
+        active_brush = QColor(255, 170, 45)
+        handle_brush = QColor(225, 245, 235)
+        r = 1.4 * scale_factor
+        active_r = 1.7 * scale_factor
+        hr = 1.0 * scale_factor
+        active_hr = 1.25 * scale_factor
+        handles_px = clone_handles(handles_px, len(anchors_px))
+        for index, anchor in enumerate(anchors_px):
+            rec = handles_px[index]
+            for kind in ("in", "out"):
+                hp = rec.get(kind)
+                if hp is None:
+                    continue
+                painter.setPen(arm_pen)
+                painter.setBrush(normal_brush)
+                painter.drawLine(anchor, hp)
+                if self._active_handle == (index, kind):
+                    painter.setPen(active_handle_pen)
+                    painter.setBrush(active_brush)
+                    painter.drawRect(QRectF(hp.x() - active_hr, hp.y() - active_hr,
+                                            2 * active_hr, 2 * active_hr))
+                else:
+                    painter.setPen(handle_pen)
+                    painter.setBrush(handle_brush)
+                    painter.drawRect(QRectF(hp.x() - hr, hp.y() - hr,
+                                            2 * hr, 2 * hr))
+        for index, pt in enumerate(anchors_px):
+            if index == self._active_node_index:
+                painter.setPen(active_pen)
+                painter.setBrush(active_brush)
+                painter.drawEllipse(pt, active_r, active_r)
+            else:
+                painter.setPen(normal_pen)
+                painter.setBrush(normal_brush)
+                painter.drawEllipse(pt, r, r)
 
     def _padded_path(self, qpoly, pad_px):
         path = QtGui.QPainterPath()
@@ -1219,6 +2117,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
         sf = float(scale_factor or 1.0)
         if sf <= 0.0:
             sf = 1.0
+
         inv = 1.0 / sf
         normalized = []
         for item in payload.get("positioned", []):
@@ -1237,6 +2136,14 @@ class LayoutItemPolygonText(QgsLayoutItem):
                     ts, tl, lx, ly, lw, paragraph_final, blank = item
                     normalized.append((ts, tl, float(lx) * inv, float(ly) * inv,
                                        float(lw) * inv, bool(paragraph_final), bool(blank)))
+                elif len(item) == 10:
+                    (ts, tl, lx, ly, lw, paragraph_final, blank,
+                     natural_width, span_x, span_width) = item
+                    normalized.append((
+                        ts, tl, float(lx) * inv, float(ly) * inv,
+                        float(lw) * inv, bool(paragraph_final), bool(blank),
+                        float(natural_width) * inv, float(span_x) * inv,
+                        float(span_width) * inv))
                 elif len(item) == 8:
                     ts, tl, lx, ly, lw, paragraph_final, blank, natural_width = item
                     normalized.append((
@@ -1249,15 +2156,22 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 normalized.append(tuple(item))
         cache = {
             "mode": mode,
+            "paint_plan_key": cache_key,
             "lh": float(payload.get("lh", 0.0)) * inv,
             "html_segments": payload.get("html_segments", []),
             "html_plain": payload.get("html_plain", ""),
+            # Ratio between QGIS' final painted advance and the QTextLayout
+            # measurement font.  It is normally ~1.0, but some condensed/
+            # narrow faces resolve with noticeably different advances.
+            "metric_width_scale": float(
+                payload.get("metric_width_scale", 1.0) or 1.0),
             "positioned": normalized,
         }
         self._layout_cache_key = cache_key
         self._layout_cache = cache
 
-    def _render_polygon_cached_layout(self, render_ctx, scale_factor, cache):
+    def _render_polygon_cached_layout(self, render_ctx, scale_factor, cache,
+                                      mode_override=None):
         try:
             from qgis.core import QgsTextRenderer
         except ImportError:
@@ -1271,6 +2185,37 @@ class LayoutItemPolygonText(QgsLayoutItem):
         sf = float(scale_factor or 1.0)
         if sf <= 0.0:
             sf = 1.0
+
+        # Compose and paint in one fixed text-metric space. The preview/export
+        # zoom is represented only by the painter transform, so it cannot
+        # alter glyph advances or cause an already-wrapped row to reflow.
+        composition_sf = 16.0
+        composition_painter = render_ctx.painter()
+        previous_context_scale = None
+        composition_saved = False
+        if composition_painter is not None:
+            try:
+                previous_context_scale = float(render_ctx.scaleFactor())
+                composition_painter.save()
+                composition_saved = True
+                composition_painter.scale(
+                    sf / composition_sf, sf / composition_sf)
+                render_ctx.setScaleFactor(composition_sf)
+                sf = composition_sf
+            except Exception:
+                if composition_saved:
+                    composition_painter.restore()
+                composition_saved = False
+                previous_context_scale = None
+
+        def _restore_composition_space():
+            if not composition_saved:
+                return
+            try:
+                if previous_context_scale is not None:
+                    render_ctx.setScaleFactor(previous_context_scale)
+            finally:
+                composition_painter.restore()
 
         def _fixed_width_transform(text_value, text_fmt, origin_x,
                                    rendered_value=None,
@@ -1294,6 +2239,8 @@ class LayoutItemPolygonText(QgsLayoutItem):
                     target_width = (
                         float(QtGui.QFontMetricsF(canonical_font).horizontalAdvance(
                             str(text_value))) / 16.0 * sf
+                        * max(0.5, min(1.5, float(
+                            cache.get("metric_width_scale", 1.0) or 1.0)))
                     )
                 actual_text = (
                     rendered_value if rendered_value is not None
@@ -1321,45 +2268,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
             except Exception:
                 return painter, 1.0, origin_x
 
-        def _justify_preview_boost(max_boost=4.0):
-            """Supersample justified rows only when preview is below 100%."""
-            try:
-                app = getattr(QtGui, "QGuiApplication", None)
-                screen = app.primaryScreen() if app is not None else None
-                dpi = float(screen.logicalDotsPerInch()) if screen else 96.0
-                reference_sf = max(1.0, dpi / 25.4)
-                return max(1.0, min(float(max_boost), reference_sf / sf))
-            except Exception:
-                return 1.0
-
-        def _fixed_composition_justify(html_text, plain_text, target_width,
-                                       render_boost=1.0,
-                                       measured_width=None,
-                                       render_html_mode=False):
-            """Calculate word spacing only in fixed composition space."""
-            try:
-                base_font, _ = self._base_font_and_color()
-                canonical_font = render_font(
-                    base_font, 16.0, None,
-                    _format_size_unit(self._text_format),
-                    _format_size_map_unit_scale(self._text_format),
-                    self._text_format.size())
-                canonical_target = float(target_width) / sf * 16.0
-                canonical_measured = None
-                if measured_width is not None:
-                    canonical_measured = (
-                        float(measured_width) / sf * 16.0)
-                return _wrap_html_for_justify(
-                    html_text, plain_text, canonical_target, canonical_font,
-                    measured_width_px=canonical_measured,
-                    css_spacing_factor=(
-                        72.0 / (25.4 * 16.0) * float(render_boost)),
-                    css_spacing_unit="pt",
-                    edge_allowance_ratio=0.0)
-            except Exception:
-                return html_text, False
-
-        mode = cache.get("mode", "plain")
+        mode = mode_override or cache.get("mode", "plain")
         lh = float(cache.get("lh", 0.0)) * sf
         positioned = cache.get("positioned", [])
 
@@ -1439,8 +2348,34 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 result.append(target_block)
             return result
 
+        def _zero_horizontal_block_margins(document):
+            """Remove HTML block side margins from single-word documents.
+
+            Geometric justification supplies the exact x coordinate for each
+            word. QGIS HTML parsing can attach block margins to a reconstructed
+            fragment, which otherwise makes a right-aligned final word stop
+            short of the authoritative polygon edge. Keep vertical margins
+            intact, but force the horizontal margins to zero.
+            """
+            result = QgsTextDocument()
+            for block in document:
+                try:
+                    block_format = QgsTextBlockFormat(block.blockFormat())
+                    margins = block_format.margins()
+                    block_format.setMargins(
+                        QgsMargins(0.0, margins.top(), 0.0, margins.bottom()))
+                    target_block = QgsTextBlock()
+                    target_block.setBlockFormat(block_format)
+                    for fragment in block:
+                        target_block.append(fragment)
+                    result.append(target_block)
+                except Exception:
+                    record_suppressed_exception()
+                    return document
+            return result
+
         def _draw_document(rect, alignment, text, text_format,
-                           component_name):
+                           component_name, zero_horizontal_margins=False):
             """Render one row through QgsTextDocument's public pipeline."""
             component_format = _component_format(
                 text_format, component_name)
@@ -1450,6 +2385,8 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 record_suppressed_exception()
             document = QgsTextDocument.fromTextAndFormat(
                 [text], component_format)
+            if zero_horizontal_margins:
+                document = _zero_horizontal_block_margins(document)
             if component_name in ("background", "buffer"):
                 document = _transparent_document(document)
             text_scale = QgsTextRenderer.calculateScaleFactorForFormat(
@@ -1486,7 +2423,8 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 rect = QRectF(x, y, width, height)
                 _draw_document(
                     rect, command["alignment"], command["text"],
-                    command["format"], component_name)
+                    command["format"], component_name,
+                    bool(command.get("zero_horizontal_margins", False)))
             except Exception:
                 record_suppressed_exception()
             finally:
@@ -1505,7 +2443,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
                     _paint_row_component(command, component_name)
 
         def _background_is_enabled():
-            if mode == "render_html":
+            if mode in ("render_html", "plain_render_html"):
                 return False
             try:
                 return bool(self._text_format.background().enabled())
@@ -1515,7 +2453,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
         background_enabled = _background_is_enabled()
 
         def _component_is_enabled(component_name):
-            if mode == "render_html":
+            if mode in ("render_html", "plain_render_html"):
                 return False
             try:
                 return bool(getattr(
@@ -1536,7 +2474,12 @@ class LayoutItemPolygonText(QgsLayoutItem):
             elif buffer_enabled:
                 global_shadow_source = "buffer"
 
-        if background_enabled:
+        if mode == "plain_render_html":
+            # Preserve Render-as-HTML's no-effects contract while sharing the
+            # exact plain glyph placement for markup-free content.
+            row_base_format = _copy_text_format_without_effects(
+                self._text_format)
+        elif background_enabled:
             row_base_format = _copy_text_format_without_background_shadow(
                 self._text_format)
         elif global_shadow_source:
@@ -1548,6 +2491,12 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 row_base_format = self._text_format
         else:
             row_base_format = self._text_format
+        # This is deliberately done for plain rows too.  It makes the QFont
+        # inherited by every renderer agree with QgsTextFormat.size(), rather
+        # than allowing rich documents to use a stale independent point size.
+        row_base_format = normalised_text_format_font(row_base_format)
+        row_base_format = _fixed_polygon_paint_format(
+            row_base_format, render_ctx)
 
         def _paint_background_buffer_text(commands):
             # QGIS cannot emit a shadow without its associated component.  For
@@ -1583,155 +2532,302 @@ class LayoutItemPolygonText(QgsLayoutItem):
             # transform as its text. Paint the complete background layer next
             # so overlapping background shapes can never cover glyphs.
             if background_enabled:
-                for command in commands:
-                    background_command = dict(command)
-                    # Start from the row's effective format so justified HTML
-                    # spacing, supersampled size and native inline formatting
-                    # use identical metrics. Restore the background only; its
-                    # shadow was emitted in the preliminary global layer.
+                # Justification places words independently in order to fill a
+                # changing polygon span.  Replaying the background for each
+                # word makes a tiled highlight.  A marked carrier is one
+                # transparent, span-locked line document, so QGIS creates the
+                # same continuous background that it creates for left/centre/
+                # right aligned rows while the actual words remain justified.
+                carriers = [
+                    command["background_carrier"] for command in commands
+                    if isinstance(command.get("background_carrier"), dict)
+                ]
+                if carriers:
+                    # QGIS text backgrounds follow individual fragments and
+                    # omit whitespace. A justified row is deliberately split
+                    # into word fragments, so use one geometric strip for the
+                    # authoritative row span instead of replaying tiled runs.
                     try:
-                        background_format = QgsTextFormat(command["format"])
-                        background_format.setBackground(
-                            self._text_format.background())
+                        settings = self._text_format.background()
+                        fill = QColor(settings.fillColor())
                     except Exception:
-                        background_format = self._text_format
-                    background_command["format"] = background_format
-                    _paint_row_component(background_command, "background")
-            _paint_buffer_then_text(commands)
-
-        if mode == "plain":
-            row_commands = []
-            n_lines = len(positioned)
-            justified_fmt = None
-            for i, item in enumerate(positioned):
-                if len(item) not in (4, 6):
-                    continue
-                if len(item) == 6:
-                    line_plain, lx, ly, lw, paragraph_final, blank = item
-                else:
-                    line_plain, lx, ly, lw = item
-                    paragraph_final = (i == n_lines - 1)
-                    blank = not str(line_plain).strip()
-                if blank:
-                    continue
-                lx = float(lx) * sf
-                ly = float(ly) * sf
-                lw = float(lw) * sf
-                justify_this_line = (
-                    self._h_align == self.ALIGN_JUSTIFY_
-                    and not paragraph_final and " " in str(line_plain).strip()
-                )
-                # Row origins are pre-aligned in fixed composition space.
-                eff_align = left_align
-                if justify_this_line:
-                    justify_boost = _justify_preview_boost()
-                    if justified_fmt is None:
+                        settings = None
+                        fill = QColor()
+                    if not fill.isValid():
                         try:
-                            justified_fmt = QgsTextFormat(row_base_format)
+                            fill = QColor(settings.color())
                         except Exception:
-                            justified_fmt = row_base_format
+                            fill = QColor(255, 255, 255, 0)
+                    for carrier in carriers:
+                        painter = render_ctx.painter()
+                        if painter is None:
+                            continue
+                        tx, ty = carrier.get("translate", (0.0, 0.0))
+                        sx, sy = carrier.get("scale", (1.0, 1.0))
+                        x, y, width, height = carrier["rect"]
+                        painter.save()
                         try:
-                            justified_fmt.setAllowHtmlFormatting(True)
+                            if tx or ty:
+                                painter.translate(tx, ty)
+                            if (abs(sx - 1.0) >= 0.001
+                                    or abs(sy - 1.0) >= 0.001):
+                                painter.scale(sx, sy)
+                            painter.setBrush(QBrush(fill))
+                            # The QGIS text-background stroke has its own
+                            # enable flag, which is not consistently exposed
+                            # by older bindings. Never infer a visible border
+                            # solely from the stored stroke colour.
+                            painter.setPen(QPen(NO_PEN))
+                            painter.drawRect(QRectF(x, y, width, height))
                         except Exception:
                             record_suppressed_exception()
-                    source_line_html = _html_escape(
-                        str(line_plain), quote=False)
-                    measured_plain_width = None
-                    try:
-                        measured_plain_width = QgsTextRenderer.textWidth(
-                            render_ctx, justified_fmt,
-                            [source_line_html])
-                    except Exception:
-                        record_suppressed_exception()
-                    line_to_draw, _ = _fixed_composition_justify(
-                        source_line_html,
-                        str(line_plain), lw, justify_boost,
-                        measured_plain_width)
-                    if justify_boost > 1.001:
+                        finally:
+                            painter.restore()
+                else:
+                    for command in commands:
+                        background_command = dict(command)
                         try:
-                            format_to_draw = QgsTextFormat(justified_fmt)
-                            format_to_draw.setSize(
-                                justified_fmt.size() * justify_boost)
+                            background_format = QgsTextFormat(command["format"])
+                            background_format.setBackground(
+                                self._text_format.background())
                         except Exception:
-                            format_to_draw = justified_fmt
-                    else:
-                        format_to_draw = justified_fmt
+                            background_format = self._text_format
+                        background_command["format"] = background_format
+                        _paint_row_component(background_command, "background")
+            _paint_buffer_then_text(commands)
 
-                    # Qt/QGIS can resolve CSS word-spacing slightly
-                    # differently from the canonical measurement. Measure the
-                    # completed native row and feed the residual width back
-                    # into spacing only, leaving glyphs and margins untouched.
-                    spacing_target = lw
-                    for _correction in range(3):
-                        try:
-                            painted_width = float(QgsTextRenderer.textWidth(
-                                render_ctx, format_to_draw,
-                                [line_to_draw])) / max(justify_boost, 1.0)
-                        except Exception:
-                            break
-                        residual = lw - painted_width
-                        if abs(residual) <= max(0.25, lw * 0.0005):
-                            break
-                        spacing_target += residual
-                        line_to_draw, applied = _fixed_composition_justify(
-                            source_line_html, str(line_plain),
-                            spacing_target, justify_boost,
-                            measured_plain_width)
-                        if not applied:
-                            break
-                else:
-                    line_to_draw = line_plain
-                    format_to_draw = row_base_format
-                _justify_w = lw
-                if justify_this_line:
-                    # Justification must alter spaces only.  Scaling the
-                    # painter changes glyph proportions and makes regular
-                    # fonts appear inconsistently condensed.
-                    width_scale = 1.0
-                    draw_lx = lx
-                    draw_ly = ly
-                    draw_width = _justify_w
-                    draw_height = lh
-                    translate = (0.0, 0.0)
-                    painter_scale = (1.0, 1.0)
-                    if justify_boost > 1.001:
-                        width_scale = justify_boost
-                        translate = (lx, ly)
-                        painter_scale = (
-                            1.0 / justify_boost, 1.0 / justify_boost)
-                        draw_lx = 0.0
-                        draw_ly = 0.0
-                        draw_width = _justify_w * justify_boost
-                        draw_height = lh * justify_boost
-                else:
-                    width_painter, width_scale, draw_lx = _fixed_width_transform(
-                        line_plain, format_to_draw, lx,
-                        apply_transform=False)
-                    draw_ly = ly
-                    draw_width = _justify_w / width_scale
-                    draw_height = lh
+        def _thaw_command_plan(kind, text_format):
+            """Return an immutable, composition-space text paint plan."""
+            plan = cache.get(f"{kind}_command_plan")
+            if not isinstance(plan, dict):
+                plan_key = cache.get("paint_plan_key")
+                plan = self._frozen_paint_plans.get(plan_key)
+            if not isinstance(plan, dict):
+                return None
+            try:
+                if plan.get("kind") != kind:
+                    return None
+                plan_scale = float(plan.get("scale", 0.0))
+                if abs(plan_scale - sf) > 1.0e-6:
+                    return None
+                commands = []
+                for rec in plan.get("commands", []):
+                    if len(rec) == 12:
+                        (text, x, y, width, height, tx, ty, sx, sy,
+                         zero_margins, context_boost, carrier_rec) = rec
+                    else:
+                        (text, x, y, width, height, tx, ty, sx, sy,
+                         zero_margins, context_boost) = rec
+                        carrier_rec = None
+                    command = {
+                        "rect": (float(x) * sf, float(y) * sf,
+                                 float(width) * sf, float(height) * sf),
+                        "alignment": left_align,
+                        "text": text,
+                        "format": text_format,
+                        "translate": (float(tx) * sf, float(ty) * sf),
+                        "scale": (float(sx), float(sy)),
+                        "zero_horizontal_margins": bool(zero_margins),
+                        "context_boost": float(context_boost),
+                    }
+                    if carrier_rec is not None:
+                        (carrier_text, cx, cy, cwidth, cheight,
+                         ctx, cty, csx, csy, carrier_zero_margins,
+                         carrier_context_boost) = carrier_rec
+                        command["background_carrier"] = {
+                            "rect": (float(cx) * sf, float(cy) * sf,
+                                     float(cwidth) * sf,
+                                     float(cheight) * sf),
+                            "alignment": left_align,
+                            "text": carrier_text,
+                            "format": text_format,
+                            "translate": (float(ctx) * sf,
+                                          float(cty) * sf),
+                            "scale": (float(csx), float(csy)),
+                            "zero_horizontal_margins": bool(
+                                carrier_zero_margins),
+                            "context_boost": float(carrier_context_boost),
+                        }
+                    commands.append(command)
+                return commands
+            except (TypeError, ValueError, KeyError):
+                return None
+
+        def _freeze_command_plan(commands, kind):
+            """Persist final glyph advances, including justified word offsets."""
+            if sf <= 0.0:
+                return
+            frozen = []
+            try:
+                for command in commands:
+                    x, y, width, height = command["rect"]
+                    tx, ty = command.get("translate", (0.0, 0.0))
+                    sx, sy = command.get("scale", (1.0, 1.0))
+                    carrier = command.get("background_carrier")
+                    carrier_rec = None
+                    if isinstance(carrier, dict):
+                        cx, cy, cwidth, cheight = carrier["rect"]
+                        ctx, cty = carrier.get("translate", (0.0, 0.0))
+                        csx, csy = carrier.get("scale", (1.0, 1.0))
+                        carrier_rec = (
+                            carrier["text"], float(cx) / sf,
+                            float(cy) / sf, float(cwidth) / sf,
+                            float(cheight) / sf, float(ctx) / sf,
+                            float(cty) / sf, float(csx), float(csy),
+                            bool(carrier.get(
+                                "zero_horizontal_margins", False)),
+                            float(carrier.get("context_boost", 1.0)),
+                        )
+                    frozen.append((
+                        command["text"], float(x) / sf, float(y) / sf,
+                        float(width) / sf, float(height) / sf,
+                        float(tx) / sf, float(ty) / sf,
+                        float(sx), float(sy),
+                        bool(command.get("zero_horizontal_margins", False)),
+                        float(command.get("context_boost", 1.0)),
+                        carrier_rec,
+                    ))
+                plan = {
+                    "kind": kind, "scale": float(sf),
+                    "commands": tuple(frozen)}
+                cache[f"{kind}_command_plan"] = plan
+                plan_key = cache.get("paint_plan_key")
+                if plan_key is not None:
+                    if (plan_key not in self._frozen_paint_plans
+                            and len(self._frozen_paint_plans) >= 12):
+                        self._frozen_paint_plans.clear()
+                    self._frozen_paint_plans[plan_key] = plan
+            except (TypeError, ValueError, KeyError):
+                # A plan is an optimisation only; rendering continues through
+                # the normal path if a binding supplies an unusual value.
+                return
+
+        def _attach_justify_row_background(command, text, text_format,
+                                           row_x, row_y, row_width):
+            """Attach a continuous background for every justified row.
+
+            QGIS intentionally leaves the paragraph-final and one-word rows
+            un-justified. They still belong to a justified paragraph and must
+            retain a background, using their natural text width rather than
+            the full scan-line span.
+            """
+            if (not background_enabled
+                    or self._h_align != self.ALIGN_JUSTIFY_):
+                return
+            try:
+                width = max(0.0, float(row_width))
+            except (TypeError, ValueError):
+                width = 0.0
+            if width <= 0.0:
+                return
+            command["background_carrier"] = {
+                "rect": (float(row_x), float(row_y), width, lh),
+                "alignment": left_align,
+                "text": text,
+                "format": text_format,
+                "translate": (0.0, 0.0),
+                "scale": (1.0, 1.0),
+                "context_boost": 1.0,
+                "zero_horizontal_margins": True,
+            }
+
+        if mode in ("plain", "plain_render_html"):
+            row_commands = _thaw_command_plan("plain", row_base_format)
+            if row_commands is None:
+                row_commands = []
+                n_lines = len(positioned)
+                for i, item in enumerate(positioned):
+                    if len(item) not in (4, 6, 10):
+                        continue
+                    if len(item) == 10:
+                        (line_plain, lx, ly, lw, paragraph_final, blank,
+                         natural_width, _span_x, _span_width) = item
+                    elif len(item) == 6:
+                        line_plain, lx, ly, lw, paragraph_final, blank = item
+                        natural_width = None
+                    else:
+                        line_plain, lx, ly, lw = item
+                        paragraph_final = (i == n_lines - 1)
+                        blank = not str(line_plain).strip()
+                        natural_width = None
+                    if blank:
+                        continue
+                    lx = float(lx) * sf
+                    ly = float(ly) * sf
+                    lw = float(lw) * sf
+                    justify_this_line = (
+                        self._h_align == self.ALIGN_JUSTIFY_
+                        and not paragraph_final and " " in str(line_plain).strip()
+                    )
+                    if justify_this_line:
+                        geometric_commands = _compose_justify_commands(
+                            self, render_ctx, 0, str(line_plain), lx, ly, lw,
+                            row_base_format, [], lh, left_align)
+                        if geometric_commands is not None:
+                            if background_enabled:
+                                (_painter, background_scale,
+                                 background_x) = _fixed_width_transform(
+                                    line_plain, row_base_format, lx,
+                                    target_width_override=lw,
+                                    apply_transform=False)
+                                geometric_commands[0]["background_carrier"] = {
+                                    "rect": (background_x, ly,
+                                             lw / background_scale, lh),
+                                    "alignment": left_align,
+                                    "text": line_plain,
+                                    "format": row_base_format,
+                                    "translate": (
+                                        (lx, 0.0) if abs(
+                                            background_scale - 1.0) >= 0.001
+                                        else (0.0, 0.0)),
+                                    "scale": (background_scale, 1.0),
+                                }
+                            row_commands.extend(geometric_commands)
+                            continue
+
+                    _painter, width_scale, draw_lx = _fixed_width_transform(
+                        line_plain, row_base_format, lx, apply_transform=False)
                     translate = (
                         (lx, 0.0) if abs(width_scale - 1.0) >= 0.001
                         else (0.0, 0.0))
-                    painter_scale = (width_scale, 1.0)
-                row_commands.append({
-                    "rect": (draw_lx, draw_ly, draw_width, draw_height),
-                    "alignment": eff_align,
-                    "text": line_to_draw,
-                    "format": format_to_draw,
-                    "translate": translate,
-                    "scale": painter_scale,
-                })
+                    row_commands.append({
+                        "rect": (draw_lx, ly, lw / width_scale, lh),
+                        "alignment": left_align,
+                        "text": line_plain,
+                        "format": row_base_format,
+                        "translate": translate,
+                        "scale": (width_scale, 1.0),
+                    })
+                    if self._h_align == self.ALIGN_JUSTIFY_:
+                        try:
+                            carrier_width = float(natural_width) * sf
+                        except (TypeError, ValueError):
+                            carrier_width = 0.0
+                        if carrier_width <= 0.0:
+                            try:
+                                carrier_width = float(QgsTextRenderer.textWidth(
+                                    render_ctx, row_base_format,
+                                    [str(line_plain)]))
+                            except Exception:
+                                carrier_width = lw
+                        _attach_justify_row_background(
+                            row_commands[-1], line_plain, row_base_format,
+                            lx, ly, carrier_width)
+                _freeze_command_plan(row_commands, "plain")
             _paint_background_buffer_text(row_commands)
+            _restore_composition_space()
             return
 
         html_segments = cache.get("html_segments", [])
         html_plain = cache.get("html_plain", "")
         if mode == "render_html":
-            draw_fmt = _copy_text_format_without_effects(self._text_format)
+            draw_fmt = _fixed_polygon_paint_format(
+                _copy_text_format_without_effects(self._text_format),
+                render_ctx)
         else:
             try:
-                draw_fmt = QgsTextFormat(row_base_format)
+                draw_fmt = _fixed_polygon_paint_format(
+                    row_base_format, render_ctx)
             except Exception:
                 draw_fmt = row_base_format
         try:
@@ -1739,32 +2835,45 @@ class LayoutItemPolygonText(QgsLayoutItem):
         except Exception:
             record_suppressed_exception()
 
+        frozen_rich_commands = _thaw_command_plan("rich", draw_fmt)
+        if frozen_rich_commands is not None:
+            _paint_background_buffer_text(frozen_rich_commands)
+            _restore_composition_space()
+            return
+
+
         row_commands = []
         n_lines = len(positioned)
         for i, item in enumerate(positioned):
-            if len(item) not in (5, 7, 8):
+            if len(item) not in (5, 7, 8, 10):
                 continue
-            if len(item) == 8:
+            if len(item) == 10:
+                (ts, tl, lx, ly, lw, paragraph_final, blank,
+                 natural_width, span_x, span_width) = item
+            elif len(item) == 8:
                 ts, tl, lx, ly, lw, paragraph_final, blank, natural_width = item
+                span_x, span_width = lx, lw
             elif len(item) == 7:
                 ts, tl, lx, ly, lw, paragraph_final, blank = item
                 natural_width = None
+                span_x, span_width = lx, lw
             else:
                 ts, tl, lx, ly, lw = item
                 paragraph_final = (i == n_lines - 1)
                 blank = False
                 natural_width = None
+                span_x, span_width = lx, lw
             lx = float(lx) * sf
             ly = float(ly) * sf
             lw = float(lw) * sf
+            span_x = float(span_x) * sf
+            span_width = float(span_width) * sf
             if natural_width is not None:
                 natural_width = float(natural_width) * sf
-            if mode == "render_html":
-                slice_font = self._text_format.font()
-                slice_color = self._text_format.color()
-            else:
-                slice_font = self._text_format.font()
-                slice_color = self._text_format.color()
+            # Every HTML mode serializes inherited runs against the canonical
+            # QGIS font. Explicit fragment styles remain in the segments, but
+            # untagged text now shares Plain Text's font and spacing engine.
+            slice_font, slice_color = self._base_font_and_color()
             line_html = segments_slice_to_html(
                 html_segments, ts, tl, slice_font, slice_color)
             source_line_html = line_html
@@ -1775,140 +2884,141 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 self._h_align == self.ALIGN_JUSTIFY_
                 and not paragraph_final and " " in line_plain.strip()
             )
-            # Row origins are pre-aligned in fixed composition space.
-            eff_align = left_align
-            if justify_this_line:
-                justify_boost = (
-                    _justify_preview_boost(16.0)
-                    if mode == "render_html"
-                    else _justify_preview_boost()
-                )
-                # Render-as-HTML supersampling is performed by temporarily
-                # increasing the render-context scale, never by copying or
-                # resizing its QgsTextFormat.  Consequently its physical CSS
-                # spacing itself must not be multiplied here.
-                spacing_boost = (
-                    1.0 if mode == "render_html" else justify_boost
-                )
-                measured_html_width = None
-                try:
-                    measured_html_width = QgsTextRenderer.textWidth(
-                        render_ctx, draw_fmt, [line_html])
-                except Exception:
-                    record_suppressed_exception()
-                line_html, _ = _fixed_composition_justify(
-                    line_html, line_plain, lw, spacing_boost,
-                    measured_html_width,
-                    render_html_mode=(mode == "render_html"))
-                eff_align = left_align
-                if justify_boost > 1.001 and mode != "render_html":
-                    try:
-                        row_draw_fmt = QgsTextFormat(draw_fmt)
-                        row_draw_fmt.setSize(
-                            draw_fmt.size() * justify_boost)
-                        # Some QGIS builds do not preserve this flag when a
-                        # temporary boosted format is copied from the plugin's
-                        # Render as HTML format.  Set it explicitly so this
-                        # mode never depends on the native Allow HTML option
-                        # having been visited/toggled first.
-                        if mode == "render_html":
-                            row_draw_fmt.setAllowHtmlFormatting(True)
-                    except Exception:
-                        row_draw_fmt = draw_fmt
-                else:
-                    row_draw_fmt = draw_fmt
 
-                if mode != "render_html":
-                    spacing_target = lw
-                    for _correction in range(3):
-                        try:
-                            painted_width = float(QgsTextRenderer.textWidth(
-                                render_ctx, row_draw_fmt,
-                                [line_html])) / max(justify_boost, 1.0)
-                        except Exception:
-                            break
-                        residual = lw - painted_width
-                        if abs(residual) <= max(0.25, lw * 0.0005):
-                            break
-                        spacing_target += residual
-                        line_html, applied = _fixed_composition_justify(
-                            source_line_html, line_plain,
-                            spacing_target, spacing_boost,
-                            measured_html_width,
-                            render_html_mode=False)
-                        if not applied:
-                            break
-            else:
-                justify_boost = 1.0
-                row_draw_fmt = draw_fmt
-            _justify_w = lw
-            if justify_this_line:
-                width_scale = 1.0
-                draw_lx = lx
-                draw_ly = ly
-                draw_width = _justify_w
-                draw_height = lh
-                translate = (0.0, 0.0)
-                painter_scale = (1.0, 1.0)
-                if justify_boost > 1.001:
-                    width_scale = justify_boost
-                    translate = (lx, ly)
-                    painter_scale = (
-                        1.0 / justify_boost, 1.0 / justify_boost)
-                    draw_lx = 0.0
-                    draw_ly = 0.0
-                    draw_width = _justify_w * justify_boost
-                    draw_height = lh * justify_boost
-            else:
-                if mode == "render_html":
-                    width_painter, width_scale, draw_lx = (
-                        _fixed_width_transform(
-                            line_plain, draw_fmt, lx,
+            if mode in ("render_html", "inline_html"):
+                if not justify_this_line:
+                    # A non-justified row is one continuous text run. Drawing
+                    # it word-by-word makes every inter-word space an isolated
+                    # QTextDocument fragment, which changes kerning and word
+                    # spacing compared with normal plain text. Draw the whole
+                    # already-wrapped line through one rich document instead.
+                    # _rows_with_fixed_origins() has already resolved the
+                    # left/centre/right origin in fixed composition space,
+                    # just as it does for normal plain text. Do not ask the
+                    # rich-document painter to resolve the alignment again
+                    # against its live preview-scale metrics: that makes the
+                    # selected alignment depend on the zoom level. Paint from
+                    # the cached origin with left alignment instead.
+                    # The QGIS rich document shapes the same characters with
+                    # slightly different advances from QTextLayout.  The row
+                    # plan is authoritative for wrapping and horizontal
+                    # alignment, so scale the document to its planned advance
+                    # while retaining native styling inside the row.
+                    _painter, width_scale, draw_lx = _fixed_width_transform(
+                        line_plain, draw_fmt, lx,
+                        rendered_value=line_html,
+                        target_width_override=natural_width,
+                        render_html_mode=(mode == "render_html"),
+                        apply_transform=False)
+                    translate = (
+                        (lx, 0.0) if abs(width_scale - 1.0) >= 0.001
+                        else (0.0, 0.0))
+                    row_commands.append({
+                        "rect": (draw_lx, ly, lw / width_scale, lh),
+                        "alignment": left_align,
+                        "text": line_html,
+                        "format": draw_fmt,
+                        "translate": translate,
+                        "scale": (width_scale, 1.0),
+                        "context_boost": 1.0,
+                        "zero_horizontal_margins": True,
+                    })
+                    if self._h_align == self.ALIGN_JUSTIFY_:
+                        carrier_width = natural_width
+                        if carrier_width is None or carrier_width <= 0.0:
+                            try:
+                                carrier_width = float(QgsTextRenderer.textWidth(
+                                    render_ctx, draw_fmt, [line_html]))
+                            except Exception:
+                                carrier_width = lw
+                        _attach_justify_row_background(
+                            row_commands[-1], line_html, draw_fmt,
+                            lx, ly, carrier_width)
+                    continue
+
+                # All rich modes use one shared word/run compositor. It
+                # measures each fragment with the same QgsTextDocument metrics
+                # pipeline used by _draw_document(), then places the fragments
+                # explicitly. This prevents the rich renderer from re-wrapping
+                # a line with condensed-font metrics after QTextLayout has
+                # already selected its polygon span.
+                if justify_this_line:
+                    # Justification is inherently a fragment layout: words
+                    # are distributed across the complete safe polygon span.
+                    rich_commands = _compose_rich_line_commands(
+                        self, render_ctx, ts, line_plain,
+                        span_x, ly, span_width, draw_fmt, html_segments,
+                        lh, left_align, "justify",
+                        base_font=slice_font, base_color=slice_color)
+                if rich_commands is not None:
+                    if background_enabled:
+                        (_painter, background_scale,
+                         background_x) = _fixed_width_transform(
+                            line_plain, draw_fmt, span_x,
                             rendered_value=line_html,
-                            target_width_override=(
-                                natural_width
-                                if natural_width is not None
-                                and natural_width > 0.0
-                                else None),
-                            render_html_mode=True,
+                            target_width_override=span_width,
+                            render_html_mode=(mode == "render_html"),
                             apply_transform=False)
-                    )
-                else:
-                    width_painter, width_scale, draw_lx = (
-                        _fixed_width_transform(
-                            line_plain, draw_fmt, lx,
-                            rendered_value=(
-                                line_html if mode == "inline_html" else None),
-                            target_width_override=(
-                                natural_width
-                                if mode == "inline_html"
-                                and natural_width is not None
-                                and natural_width > 0.0
-                                else None),
-                            apply_transform=False)
-                    )
-                draw_ly = ly
+                        rich_commands[0]["background_carrier"] = {
+                            "rect": (background_x, ly,
+                                     span_width / background_scale, lh),
+                            "alignment": left_align,
+                            "text": line_html,
+                            "format": draw_fmt,
+                            "translate": (
+                                (span_x, 0.0) if abs(
+                                    background_scale - 1.0) >= 0.001
+                                else (0.0, 0.0)),
+                            "scale": (background_scale, 1.0),
+                            "context_boost": 1.0,
+                            "zero_horizontal_margins": True,
+                        }
+                    row_commands.extend(rich_commands)
+                    continue
+
+                # Safe fallback when a rich fragment cannot be measured.
+                eff_align = left_align
+                _justify_w = lw
+                width_painter, width_scale, draw_lx = _fixed_width_transform(
+                    line_plain, draw_fmt, lx,
+                    rendered_value=line_html,
+                    target_width_override=None,
+                    render_html_mode=(mode == "render_html"),
+                    apply_transform=False)
                 draw_width = _justify_w / width_scale
-                draw_height = lh
-                translate = (
-                    (lx, 0.0) if abs(width_scale - 1.0) >= 0.001
-                    else (0.0, 0.0))
-                painter_scale = (width_scale, 1.0)
+            else:
+                # Non-rich path retains the existing renderer behavior.
+                eff_align = left_align
+                _justify_w = lw
+                width_painter, width_scale, draw_lx = (
+                    _fixed_width_transform(
+                        line_plain, draw_fmt, lx,
+                        rendered_value=None,
+                        target_width_override=None,
+                        render_html_mode=False,
+                        apply_transform=False)
+                )
+                draw_width = _justify_w / width_scale
+            draw_ly = ly
+            draw_height = lh
+            translate = (
+                (lx, 0.0) if abs(width_scale - 1.0) >= 0.001
+                else (0.0, 0.0))
+            painter_scale = (width_scale, 1.0)
 
             row_commands.append({
                 "rect": (draw_lx, draw_ly, draw_width, draw_height),
                 "alignment": eff_align,
                 "text": line_html,
-                "format": row_draw_fmt,
+                "format": draw_fmt,
                 "translate": translate,
                 "scale": painter_scale,
-                "context_boost": (
-                    justify_boost
-                    if justify_this_line and mode == "render_html"
-                    else 1.0),
+                "context_boost": 1.0,
             })
 
+        _freeze_command_plan(row_commands, "rich")
         _paint_background_buffer_text(row_commands)
+        _restore_composition_space()
 
     def _draw_wrapped_text(self, render_ctx, points, resolved_text,
                             pad_px, hm_px, vm_px, scale_factor):
@@ -1943,10 +3053,24 @@ class LayoutItemPolygonText(QgsLayoutItem):
         vm_px *= composition_ratio
         scale_factor = composition_scale_factor
 
-        render_html = self._allow_html
-        inline_html = (
-            not render_html
+        requested_render_html = self._allow_html
+        requested_inline_html = (
+            not requested_render_html
             and text_format_allows_html(self._text_format)
+        )
+        plain_compatible = not _has_html_semantics(resolved_text)
+
+        # A mode switch must not move plain single-flow text.  Route it
+        # through the same QTextLayout/QgsTextRenderer geometry as ordinary
+        # plain text unless the input actually asks for HTML semantics.
+        # Render-as-HTML still collapses ordinary source newlines/whitespace;
+        # only explicit HTML breaks and blocks take the rich path.
+        render_html_plain = requested_render_html and plain_compatible
+        render_html = requested_render_html and not plain_compatible
+        inline_html = requested_inline_html and not plain_compatible
+        layout_text = (
+            _html_single_flow_text(resolved_text)
+            if render_html_plain else resolved_text
         )
 
         base_font, base_color = self._base_font_and_color()
@@ -1963,11 +3087,15 @@ class LayoutItemPolygonText(QgsLayoutItem):
         except Exception:
             cap = None
 
-        cache_key = self._layout_signature(resolved_text, render_html, inline_html)
+        cache_key = self._layout_signature(
+            layout_text, render_html, inline_html, render_html_plain,
+            plain_compatible=plain_compatible)
         if cache_key == self._layout_cache_key and self._layout_cache is not None:
             try:
                 self._render_polygon_cached_layout(
-                    render_ctx, display_scale_factor, self._layout_cache)
+                    render_ctx, display_scale_factor, self._layout_cache,
+                    mode_override=(
+                        "plain_render_html" if render_html_plain else None))
             except Exception:
                 record_suppressed_exception()
             return
@@ -1977,15 +3105,23 @@ class LayoutItemPolygonText(QgsLayoutItem):
         html_formats = []
         html_block_spacing = {}
         if render_html:
+            # Preserve only explicit HTML font attributes over the canonical
+            # QGIS font. This applies to justification as well: otherwise Qt
+            # reintroduces a scale-dependent default font for its word runs.
             html_segments = extract_segments(
-                resolved_text, True, base_font, base_color,
+                layout_text, True, base_font, base_color,
+                overlay_base_font=True,
                 block_spacing_out=html_block_spacing)
             html_plain, html_formats = segments_to_plain_and_formats(
                 html_segments, scale_factor, None,
                 fmt_size_unit, fmt_size_scale)
         elif inline_html:
+            # Supply QGIS' parser with the same canonical font that creates
+            # the plain QTextLayout row plan.  It prevents inherited QGIS
+            # defaults from reintroducing a stale document point size.
             html_segments = extract_qgis_html_segments(
-                resolved_text, self._text_format, base_font, base_color)
+                layout_text, normalised_text_format_font(self._text_format),
+                base_font, base_color)
             html_plain, html_formats = segments_to_plain_and_formats(
                 html_segments, scale_factor, None,
                 fmt_size_unit, fmt_size_scale)
@@ -2005,7 +3141,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 if len(case_measure) == len(plain_measure):
                     plain_measure = case_measure
         else:
-            plain_measure = apply_capitalization(resolved_text, cap)
+            plain_measure = apply_capitalization(layout_text, cap)
 
         # QTextLayout does not consistently treat LF/CRLF as a forced line
         # break (the behaviour varies between Qt versions).  U+2028 is Qt's
@@ -2017,6 +3153,44 @@ class LayoutItemPolygonText(QgsLayoutItem):
         if render_html or inline_html:
             html_plain = plain_measure
 
+        # Calibrate QTextLayout's horizontal advances against the same
+        # QgsTextRenderer which performs the final paint.  Certain condensed
+        # and narrow faces resolve to slightly different advances in Qt's
+        # shaping/layout path than in QGIS' renderer.  A single width ratio is
+        # enough to keep wrapping, right/center alignment and painting in the
+        # same metric space without stretching the rendered glyphs.
+        metric_width_scale = 1.0
+        try:
+            # One base-font calibration governs every row.  HTML formatting is
+            # applied by QTextLayout format ranges afterwards, so a tagged run
+            # cannot change the safe-span calculation for untagged text that
+            # precedes it in the same paragraph.
+            metric_sample = " ".join(
+                str(plain_measure).replace("\u2028", " ").split())
+            if len(metric_sample) > 240:
+                metric_sample = metric_sample[:240].rsplit(" ", 1)[0]
+            if metric_sample:
+                display_font = render_font(
+                    base_font, display_scale_factor, None,
+                    fmt_size_unit, fmt_size_scale, self._text_format.size())
+                probe = QtGui.QTextLayout(metric_sample, display_font)
+                _apply_design_metrics_to_layout(probe)
+                probe.beginLayout()
+                probe_line = probe.createLine()
+                qt_probe_width = 0.0
+                if probe_line.isValid():
+                    probe_line.setLineWidth(1000000.0)
+                    qt_probe_width = float(probe_line.naturalTextWidth())
+                probe.endLayout()
+                qgis_probe_width = float(QgsTextRenderer.textWidth(
+                    render_ctx, self._text_format, [metric_sample]))
+                if qt_probe_width > 0.01 and qgis_probe_width > 0.01:
+                    ratio = qgis_probe_width / qt_probe_width
+                    if 0.65 <= ratio <= 1.35:
+                        metric_width_scale = ratio
+        except Exception:
+            metric_width_scale = 1.0
+
         line_height_mult = 1.0
         try:
             line_height_mult = max(0.5, self._text_format.lineHeight())
@@ -2024,7 +3198,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
             line_height_mult = 1.0
         lh = max(fm.height() * line_height_mult, 1.0)
         inline_font_samples = []
-        if inline_html:
+        if render_html or inline_html:
             for fmt_range in html_formats:
                 try:
                     sample = plain_measure[
@@ -2126,8 +3300,20 @@ class LayoutItemPolygonText(QgsLayoutItem):
                     return start, base, base + hanging
             return None
 
+        # Use exactly the same safe scan-line span for justification as for
+        # left/right alignment.  _text_visual_padding() already supplies the
+        # true ink/effect allowance, so adding a second justify-only inset
+        # creates the visible right-side margin which right alignment does not
+        # have.
+        justify_edge_inset = 0.0
+
         def _compose_rows(candidate_y):
             """Lay out once for measurement and rendering.
+
+            A single physical row may contain multiple disjoint polygon spans.
+            In that case consecutive QTextLine fragments are placed at the same
+            y coordinate, left-to-right, so text continues through every valid
+            interior region before advancing to the next visual row.
 
             Row tuples are (start, length, left, y, width, paragraph_final,
             blank, formatted_natural_width).  Forced separators are retained
@@ -2142,68 +3328,115 @@ class LayoutItemPolygonText(QgsLayoutItem):
             py = max(avail_top, float(candidate_y)) + html_leading
             complete = False
             layout.beginLayout()
+
             for _safety in range(5000):
-                qline = layout.createLine()
-                if not qline.isValid():
+                first_line = layout.createLine()
+                if not first_line.isValid():
                     complete = True
                     break
-                ph = max(qline.height(), lh)
+
+                probe_height = max(first_line.height(), lh)
                 cy = py
-                chosen = None
+                safe_spans = []
                 for _ in range(60):
-                    if cy + ph > avail_bottom + 0.01:
+                    if cy + probe_height > avail_bottom + 0.01:
                         break
-                    span = _line_safe_span(
+                    safe_spans = _line_safe_spans(
                         points, cy - visual_pad_y,
-                        cy + ph + visual_pad_y,
-                        pad_px, hm_px, visual_pad_x)
-                    if span and span[1] - span[0] > 1.0:
-                        line_start = qline.textStart()
-                        list_insets = _list_insets_for_offset(line_start)
-                        left = span[0]
-                        if list_insets is not None:
-                            list_start, first_inset, continuation_inset = list_insets
-                            left += (
-                                first_inset if line_start == list_start
-                                else continuation_inset
-                            )
-                        width = span[1] - left
-                        if width <= 1.0:
-                            cy += ph
-                            continue
-                        qline.setLineWidth(width)
-                        chosen = (left, width, cy)
-                        if qline.naturalTextWidth() <= width + 0.5:
-                            break
-                    cy += ph
-                if chosen is None:
+                        cy + probe_height + visual_pad_y,
+                        pad_px, hm_px,
+                        visual_pad_x + justify_edge_inset)
+                    if safe_spans:
+                        break
+                    cy += probe_height
+
+                if not safe_spans:
                     break
-                left, width, row_y = chosen
-                # QTextLine decides its wrapped text range from the assigned
-                # width.  Reading textLength before setLineWidth makes the
-                # first line consume the entire document as one clipped row.
-                ts = qline.textStart()
-                raw_len = qline.textLength()
-                tl = raw_len
-                forced = False
-                while tl > 0 and plain_measure[ts + tl - 1:ts + tl] in ("\n", "\u2028"):
-                    forced = True
-                    tl -= 1
+
+                row_y = cy
+                row_height = probe_height
                 block_advance = 0.0
-                if forced and raw_len > tl:
-                    block_advance = sum(
-                        html_break_advances.get(offset, 0.0)
-                        for offset in range(ts + tl, ts + raw_len)
-                    )
-                blank = not plain_measure[ts:ts + tl].strip()
-                rows.append((
-                    ts, tl, left, row_y, width, forced, blank,
-                    max(0.0, float(qline.naturalTextWidth()))))
+                line_for_span = first_line
+                row_finished = False
+                document_finished = False
+
+                for span_index, span in enumerate(safe_spans):
+                    if span_index > 0:
+                        line_for_span = layout.createLine()
+                        if not line_for_span.isValid():
+                            complete = True
+                            document_finished = True
+                            break
+
+                    row_height = max(
+                        row_height, max(line_for_span.height(), lh))
+
+                    left, right = span
+                    line_start = line_for_span.textStart()
+                    list_insets = _list_insets_for_offset(line_start)
+                    # List paragraph indentation belongs at the beginning of
+                    # the visual row.  A second lobe on that same row is a
+                    # continuation of the line, not a new indented line.
+                    if list_insets is not None and span_index == 0:
+                        list_start, first_inset, continuation_inset = list_insets
+                        left += (
+                            first_inset if line_start == list_start
+                            else continuation_inset
+                        )
+
+                    width = right - left
+                    if width <= 1.0:
+                        # Do not consume the QTextLine on an unusably narrow
+                        # first span.  Try the next region with the same line.
+                        if span_index == 0:
+                            continue
+                        break
+
+                    # QTextLayout works in its own advance metric space.
+                    # Convert the physical polygon span into that space so the
+                    # line break predicts the final QgsTextRenderer width.
+                    line_for_span.setLineWidth(
+                        width / max(0.65, min(1.35, metric_width_scale)))
+
+                    ts = line_for_span.textStart()
+                    raw_len = line_for_span.textLength()
+                    tl = raw_len
+                    forced = False
+                    while (
+                        tl > 0
+                        and plain_measure[ts + tl - 1:ts + tl]
+                        in ("\n", "\u2028")
+                    ):
+                        forced = True
+                        tl -= 1
+
+                    if forced and raw_len > tl:
+                        block_advance = sum(
+                            html_break_advances.get(offset, 0.0)
+                            for offset in range(ts + tl, ts + raw_len)
+                        )
+
+                    blank = not plain_measure[ts:ts + tl].strip()
+                    rows.append((
+                        ts, tl, left, row_y, width, forced, blank,
+                        max(0.0, float(line_for_span.naturalTextWidth())
+                            * metric_width_scale)))
+
+                    if forced:
+                        row_finished = True
+                        break
+
                 py = (
                     row_y
-                    + max(qline.height(), lh) * line_height_mult
+                    + row_height * line_height_mult
                     + block_advance
                 )
+
+                if document_finished:
+                    break
+                if row_finished:
+                    continue
+
             layout.endLayout()
             if complete:
                 py += html_trailing
@@ -2250,11 +3483,11 @@ class LayoutItemPolygonText(QgsLayoutItem):
             for (ts, tl, lx, ly, lw, paragraph_final, blank,
                  formatted_natural) in rows:
                 line_text = plain_measure[ts:ts + tl]
-                natural = (
-                    max(0.0, float(formatted_natural))
-                    if render_html or inline_html
-                    else max(0.0, float(fm.horizontalAdvance(line_text)))
-                )
+                # formatted_natural has already been calibrated into the
+                # final renderer's metric space.  Use it for every mode so
+                # condensed/narrow fonts do not acquire a separate alignment
+                # estimate here.
+                natural = max(0.0, float(formatted_natural))
                 justify_row = (
                     self._h_align == self.ALIGN_JUSTIFY_
                     and not paragraph_final and " " in line_text.strip()
@@ -2270,8 +3503,16 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 else:
                     draw_x = lx
                     draw_w = min(lw, natural + 2.0 * visual_pad_x)
+                # Keep the unmodified safe scan-line span as well.  The
+                # rich renderer measures fragments with QgsTextDocument,
+                # whereas QTextLayout supplies ``natural`` above.  Passing
+                # only the pre-shifted row rectangle to rich alignment would
+                # apply center/right positioning against two different metric
+                # systems.  Justification already retained this full span,
+                # which is why it was the only stable rich-text alignment.
                 fixed.append((ts, tl, draw_x, ly, draw_w,
-                              paragraph_final, blank, formatted_natural))
+                              paragraph_final, blank, formatted_natural,
+                              lx, lw))
             return fixed
 
         composed_rows = _rows_with_fixed_origins(composed_rows)
@@ -2295,6 +3536,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
                     "positioned": positioned_html,
                     "html_segments": html_segments,
                     "html_plain": html_plain,
+                    "metric_width_scale": metric_width_scale,
                 }, scale_factor)
 
             self._render_polygon_cached_layout(
@@ -2315,6 +3557,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
                     "positioned": positioned_html,
                     "html_segments": html_segments,
                     "html_plain": html_plain,
+                    "metric_width_scale": metric_width_scale,
                 }, scale_factor)
 
             self._render_polygon_cached_layout(
@@ -2326,17 +3569,21 @@ class LayoutItemPolygonText(QgsLayoutItem):
         positioned = [
             (plain_measure[ts:ts + tl], lx, ly, lw, paragraph_final, blank)
             for (ts, tl, lx, ly, lw, paragraph_final, blank,
-                 _formatted_natural) in composed_rows
+                 _formatted_natural, _span_x, _span_width) in composed_rows
         ]
 
         self._store_polygon_layout_cache(
-            cache_key, "plain", {
+            cache_key,
+            "plain", {
                 "lh": lh,
                 "positioned": positioned,
+                "metric_width_scale": metric_width_scale,
             }, scale_factor)
 
         self._render_polygon_cached_layout(
-            render_ctx, display_scale_factor, self._layout_cache)
+            render_ctx, display_scale_factor, self._layout_cache,
+            mode_override=(
+                "plain_render_html" if render_html_plain else None))
         return
 
 
@@ -2372,6 +3619,7 @@ class LayoutItemPolygonText(QgsLayoutItem):
         element.setAttribute("polyVAlign",   str(self._v_align))
         node_str = ";".join(f"{n.x():.6f},{n.y():.6f}" for n in self._nodes)
         element.setAttribute("polyNodes", node_str)
+        element.setAttribute("polyBezier", serialise_handles(self._bezier_handles))
         # Persist full text format (font, color, size, buffer, shadow, …)
         _append_text_format_to_element(
             element, document, context, self._text_format, "polyTextFormat")
@@ -2422,6 +3670,11 @@ class LayoutItemPolygonText(QgsLayoutItem):
                 nodes.append(QPointF(float(xs), float(ys)))
             if len(nodes) >= 3:
                 self._nodes = nodes
+        bezier_text = element.attribute("polyBezier", "")
+        loaded_handles = deserialise_handles(bezier_text, len(self._nodes))
+        self._bezier_handles = ensure_closed_handles(
+            self._nodes, loaded_handles if loaded_handles is not None
+            else bounded_polygon_handles(self._nodes))
         return True
 
     def clone(self):

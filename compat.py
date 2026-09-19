@@ -111,3 +111,9 @@ KEY_ESCAPE = _resolve_enum(Qt, "Key_Escape", Qt, "Key", "Key_Escape")
 
 # ---- Text option word wrap ----------------------------------------------------
 WORD_WRAP = _resolve_enum(QTextOption, "WordWrap", QTextOption, "WrapMode", "WordWrap")
+
+# ---- Keyboard modifiers ----------------------------------------------------
+CTRL_MODIFIER = _resolve_enum(Qt, "ControlModifier", Qt, "KeyboardModifier", "ControlModifier")
+SHIFT_MODIFIER = _resolve_enum(Qt, "ShiftModifier", Qt, "KeyboardModifier", "ShiftModifier")
+ALT_MODIFIER = _resolve_enum(Qt, "AltModifier", Qt, "KeyboardModifier", "AltModifier")
+META_MODIFIER = _resolve_enum(Qt, "MetaModifier", Qt, "KeyboardModifier", "MetaModifier")

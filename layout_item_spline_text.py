@@ -14,10 +14,17 @@ from .compat import (
 )
 from .text_engine import (
     evaluate_expressions, extract_segments, segments_to_char_stream,
-    PathLengthMapper, build_smooth_path, point_segment_distance,
-    render_font, text_format_allows_html,
+    PathLengthMapper, point_segment_distance,
+    render_font, text_format_allows_html, text_format_base_font,
 )
-from .icons import spline_icon
+from .bezier import (
+    build_bezier_path, catmull_rom_handles, clone_handles, empty_handles,
+    sanitise_open_handles,
+    handle_scene_records, nearest_segment, split_segment,
+    convert_segment_to_curve, convert_segment_to_straight, reverse_geometry,
+    serialise_handles, deserialise_handles, apply_node_mode,
+)
+from .icons import spline_item_icon
 from .keep_alive import keep_alive
 from .reliability import record_suppressed_exception
 
@@ -583,61 +590,10 @@ def _draw_with_optional_paint_effect(render_ctx, fallback_painter, effect,
         draw_func(fallback_painter)
         return
 
-    if picture_cache is not None and cache_key is not None:
-        try:
-            cached_picture = picture_cache.get(cache_key)
-            if cached_picture is not None:
-                fallback_painter.drawPicture(0, 0, cached_picture)
-                return
-        except Exception:
-            record_suppressed_exception()
-
-        # Record the completed QGIS effect output once. QPicture preserves the
-        # exact painter commands produced by the effect stack and is cheap to
-        # replay during unchanged preview redraws (selection, panel opening,
-        # expose events). Exports bypass this branch and are always fresh.
-        picture = QtGui.QPicture()
-        recording_painter = QtGui.QPainter(picture)
-        original_painter = None
-        ended = False
-        recorded = False
-        try:
-            original_painter = render_ctx.painter()
-            render_ctx.setPainter(recording_painter)
-            begin_result = effect.begin(render_ctx)
-            if hasattr(begin_result, "drawPath"):
-                effect_painter = begin_result
-            else:
-                effect_painter = render_ctx.painter() or recording_painter
-            draw_func(effect_painter)
-            effect.end(render_ctx)
-            ended = True
-            recorded = True
-        except Exception:
-            if not ended:
-                try:
-                    effect.end(render_ctx)
-                except Exception:
-                    record_suppressed_exception()
-        finally:
-            try:
-                render_ctx.setPainter(original_painter or fallback_painter)
-            except Exception:
-                record_suppressed_exception()
-            try:
-                recording_painter.end()
-            except Exception:
-                record_suppressed_exception()
-
-        if recorded:
-            fallback_painter.drawPicture(0, 0, picture)
-            try:
-                bounds = picture.boundingRect()
-                if max(0, bounds.width()) * max(0, bounds.height()) <= 8_000_000:
-                    picture_cache[cache_key] = picture
-            except Exception:
-                record_suppressed_exception()
-            return
+    # ``picture_cache`` and ``cache_key`` are retained for call compatibility,
+    # but deliberately ignored. QPicture recording requires swapping the
+    # painter held by QgsRenderContext, which is unsafe during Qt 6 layout
+    # scene painting and can terminate QGIS without a Python exception.
 
     ended = False
     try:
@@ -1279,9 +1235,49 @@ def _draw_buffer_paths(painter, paths, color):
 
 
 def _draw_buffer_strokes(painter, paths, color, stroke_width):
-    """Paint a glyph buffer directly, without materializing halo geometry."""
+    """Paint a glyph buffer without darkening overlapping translucent halos."""
+    if not paths:
+        return
     painter.save()
     try:
+        # At full opacity the direct pen path is substantially faster. With a
+        # translucent text format, however, SourceOver compositing each glyph
+        # separately makes overlaps between neighbouring buffer strokes darker
+        # than the rest of the buffer. Native QGIS treats the buffer as one
+        # component. Paint one compound path when opacity makes that
+        # distinction visible -- do not boolean-union paths here, because that
+        # becomes expensive during interactive zooming.
+        try:
+            effective_alpha = float(color.alphaF()) * float(painter.opacity())
+        except Exception:
+            effective_alpha = 1.0
+        if effective_alpha < 0.999:
+            stroker = QtGui.QPainterPathStroker()
+            stroker.setWidth(max(0.0, stroke_width))
+            try:
+                stroker.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+                stroker.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+            except AttributeError:
+                # Qt 5 exposes these enums at a different binding location;
+                # the default stroker style remains a valid fallback.
+                record_suppressed_exception()
+            merged = QtGui.QPainterPath()
+            try:
+                fill_rule = getattr(QtCore.Qt, "FillRule", QtCore.Qt)
+                merged.setFillRule(fill_rule.WindingFill)
+            except (AttributeError, TypeError):
+                record_suppressed_exception()
+            for path in paths:
+                # A compound path is rasterised in one draw call, so
+                # intersections get one alpha application. ``addPath`` keeps
+                # this linear in glyph count, unlike QPainterPath.united().
+                merged.addPath(path)
+                if stroke_width > 0.0:
+                    merged.addPath(stroker.createStroke(path))
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(NO_PEN))
+            painter.drawPath(merged)
+            return
         painter.setBrush(QBrush(color))
         painter.setPen(_round_join_pen(color, max(0.0, stroke_width)))
         for path in paths:
@@ -1678,8 +1674,13 @@ class LayoutItemSplineText(QgsLayoutItem):
             QPointF(0.5,  0.2),
             QPointF(0.95, 0.5),
         ]
+        # v1.0.2: cubic Bezier control points.  The initial handles are the
+        # exact Catmull-Rom -> cubic conversion used by v1.0.1, so existing
+        # spline appearance is preserved while becoming directly editable.
+        self._bezier_handles = catmull_rom_handles(self._nodes)
         # Transient edit-state only.  This is deliberately not serialized.
         self._active_node_index = -1
+        self._active_handle = None
         # Cache the composed glyph layout so zoom redraws do not reflow text.
         self._layout_cache_key = None
         self._layout_cache = None
@@ -1689,6 +1690,7 @@ class LayoutItemSplineText(QgsLayoutItem):
         self._effect_geometry_cache = {}
         self._shadow_image_cache = {}
         self._paint_effect_picture_cache = {}
+
         try:
             self.sizePositionChanged.connect(self._request_movement_repaint)
         except Exception:
@@ -1752,15 +1754,11 @@ class LayoutItemSplineText(QgsLayoutItem):
         if self.isSelected():
             return super().shape()
 
-        rect = self.rect()
-        nodes = [
-            QPointF(node.x() * rect.width(), node.y() * rect.height())
-            for node in self._nodes
-        ]
+        nodes, handles = self._local_bezier_geometry()
         if len(nodes) < 2:
             return super().shape()
 
-        path = build_smooth_path(nodes)
+        path = build_bezier_path(nodes, handles, closed=False)
         if path.isEmpty():
             return super().shape()
 
@@ -1971,7 +1969,7 @@ class LayoutItemSplineText(QgsLayoutItem):
 
     # ---------------------------------------------------------------- identity
     def type(self):        return SPLINE_TEXT_ITEM_TYPE
-    def icon(self):        return spline_icon()
+    def icon(self):        return spline_item_icon()
     def displayName(self): return "Spline Text"
 
     def estimatedFrameBleed(self):
@@ -1995,7 +1993,167 @@ class LayoutItemSplineText(QgsLayoutItem):
     def activeNodeIndex(self):
         return self._active_node_index
 
+    def setActiveHandle(self, index=None, kind=None):
+        value = None
+        if index is not None and kind in ("in", "out") and 0 <= int(index) < len(self._nodes):
+            value = (int(index), kind)
+        if value != self._active_handle:
+            self._active_handle = value
+            self.update()
+
+    def activeHandle(self):
+        return self._active_handle
+
     def nodesNormalised(self): return list(self._nodes)
+
+    def _normalised_handle_records(self):
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        return clone_handles(self._bezier_handles, len(self._nodes))
+
+    def _local_bezier_geometry(self):
+        rect = self.rect()
+        points = [QPointF(n.x() * rect.width(), n.y() * rect.height()) for n in self._nodes]
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        handles = clone_handles(self._bezier_handles, len(self._nodes))
+        for rec in handles:
+            for kind in ("in", "out"):
+                pt = rec.get(kind)
+                if pt is not None:
+                    rec[kind] = QPointF(pt.x() * rect.width(), pt.y() * rect.height())
+        return points, handles
+
+    def handleScenePositions(self):
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        return handle_scene_records(self, self._nodes, self._bezier_handles)
+
+    def nodeMode(self, index):
+        if 0 <= index < len(self._bezier_handles):
+            return self._bezier_handles[index].get("mode", "corner")
+        return "corner"
+
+    def _refresh_bezier_geometry_bounds(self):
+        """Synchronise item bounds after mode/reset operations immediately."""
+        old_dirty = self._expanded_scene_dirty_rect()
+        anchors, handle_map = self._scene_geometry()
+        self._apply_scene_geometry(anchors, handle_map)
+        self._update_scene_dirty_area(old_dirty, self._expanded_scene_dirty_rect())
+        self._request_spline_repaint(force_layout=True)
+
+    def setNodeMode(self, index, mode):
+        if not (0 <= index < len(self._nodes)) or mode not in ("corner", "smooth", "symmetric"):
+            return False
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        self._bezier_handles, changed = apply_node_mode(
+            self._nodes, self._bezier_handles, index, mode, closed=False)
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        if not changed:
+            return False
+        self._refresh_bezier_geometry_bounds()
+        return True
+
+    def resetNodeHandles(self, index):
+        if not (0 <= index < len(self._nodes)):
+            return False
+        self._bezier_handles = clone_handles(self._bezier_handles, len(self._nodes))
+        self._bezier_handles[index]["in"] = None
+        self._bezier_handles[index]["out"] = None
+        self._bezier_handles[index]["mode"] = "corner"
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        self._refresh_bezier_geometry_bounds()
+        return True
+
+    def nearestBezierSegment(self, scene_pos):
+        local = self.mapFromScene(scene_pos)
+        points, handles = self._local_bezier_geometry()
+        return nearest_segment(local, points, handles, closed=False)
+
+    def convertSegmentToCurve(self, index):
+        self._bezier_handles = sanitise_open_handles(
+            convert_segment_to_curve(
+                self._nodes, self._bezier_handles, index, closed=False),
+            len(self._nodes))
+        self.update()
+        return True
+
+    def convertSegmentToStraight(self, index):
+        self._bezier_handles = sanitise_open_handles(
+            convert_segment_to_straight(
+                self._bezier_handles, index, len(self._nodes), closed=False),
+            len(self._nodes))
+        self.update()
+        return True
+
+    def _scene_geometry(self):
+        anchors = self.nodeScenePositions()
+        handle_map = {(i, kind): pt for i, kind, pt in self.handleScenePositions()}
+        return anchors, handle_map
+
+    def _apply_scene_geometry(self, anchors, handle_map):
+        all_points = list(anchors) + list(handle_map.values())
+        if not all_points:
+            return
+        xs = [p.x() for p in all_points]
+        ys = [p.y() for p in all_points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        new_w = max(max_x - min_x, 5.0)
+        new_h = max(max_y - min_y, 5.0)
+        self.attemptSetSceneRect(QRectF(min_x, min_y, new_w, new_h))
+        self._nodes = [QPointF((p.x() - min_x) / new_w, (p.y() - min_y) / new_h) for p in anchors]
+        hs = clone_handles(self._bezier_handles, len(self._nodes))
+        for i, rec in enumerate(hs):
+            for kind in ("in", "out"):
+                sp = handle_map.get((i, kind))
+                rec[kind] = (QPointF((sp.x() - min_x) / new_w, (sp.y() - min_y) / new_h)
+                             if sp is not None else None)
+        self._bezier_handles = sanitise_open_handles(hs, len(self._nodes))
+
+    def setBezierHandleAtScenePos(self, index, kind, scene_pos, independent=False, constrain=False):
+        if not (0 <= index < len(self._nodes)) or kind not in ("in", "out"):
+            return
+        # Open splines use only one control point at each endpoint. The first
+        # anchor has no incoming segment and the last has no outgoing segment.
+        if (index == 0 and kind == "in") or (index == len(self._nodes) - 1 and kind == "out"):
+            return
+        old_dirty = self._expanded_scene_dirty_rect()
+        anchors, handle_map = self._scene_geometry()
+        anchor = anchors[index]
+        target = QPointF(scene_pos)
+        if constrain:
+            dx, dy = target.x() - anchor.x(), target.y() - anchor.y()
+            radius = math.hypot(dx, dy)
+            if radius > 0:
+                step = math.pi / 12.0
+                angle = round(math.atan2(dy, dx) / step) * step
+                target = QPointF(anchor.x() + math.cos(angle) * radius,
+                                 anchor.y() + math.sin(angle) * radius)
+        handle_map[(index, kind)] = target
+        mode = self.nodeMode(index)
+        opposite = "out" if kind == "in" else "in"
+        opposite_is_valid = not (
+            (index == 0 and opposite == "in") or
+            (index == len(self._nodes) - 1 and opposite == "out"))
+        if not independent and opposite_is_valid and mode in ("smooth", "symmetric"):
+            old_other = handle_map.get((index, opposite))
+            vx, vy = target.x() - anchor.x(), target.y() - anchor.y()
+            length = math.hypot(vx, vy)
+            if length > 1e-9:
+                if mode == "symmetric" or old_other is None:
+                    other_len = length
+                else:
+                    other_len = math.hypot(old_other.x() - anchor.x(), old_other.y() - anchor.y())
+                handle_map[(index, opposite)] = QPointF(
+                    anchor.x() - vx / length * other_len,
+                    anchor.y() - vy / length * other_len)
+        self._apply_scene_geometry(anchors, handle_map)
+        self._update_scene_dirty_area(old_dirty, self._expanded_scene_dirty_rect())
+        self._request_spline_repaint(force_layout=True)
 
     def nodeScenePositions(self):
         rect = self.rect()
@@ -2007,79 +2165,71 @@ class LayoutItemSplineText(QgsLayoutItem):
     def setNodeAtScenePos(self, index, scene_pos):
         if not (0 <= index < len(self._nodes)):
             return
-        # Expand the bounding box so nodes can be dragged outside it,
-        # mirroring QGIS native polygon/polyline node-item behaviour.
         old_dirty = self._expanded_scene_dirty_rect()
-        all_scene = self.nodeScenePositions()
-        all_scene[index] = scene_pos
-        xs = [p.x() for p in all_scene]
-        ys = [p.y() for p in all_scene]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        new_w = max(max_x - min_x, 5.0)
-        new_h = max(max_y - min_y, 5.0)
-        self.attemptSetSceneRect(QRectF(min_x, min_y, new_w, new_h))
-        self._nodes = [
-            QPointF(
-                min(max((p.x() - min_x) / new_w, 0.0), 1.0),
-                min(max((p.y() - min_y) / new_h, 0.0), 1.0),
-            )
-            for p in all_scene
-        ]
+        anchors, handle_map = self._scene_geometry()
+        old_anchor = anchors[index]
+        dx = scene_pos.x() - old_anchor.x()
+        dy = scene_pos.y() - old_anchor.y()
+        anchors[index] = QPointF(scene_pos)
+        for kind in ("in", "out"):
+            key = (index, kind)
+            hp = handle_map.get(key)
+            if hp is not None:
+                handle_map[key] = QPointF(hp.x() + dx, hp.y() + dy)
+        self._apply_scene_geometry(anchors, handle_map)
         self._update_scene_dirty_area(old_dirty, self._expanded_scene_dirty_rect())
+        self._request_spline_repaint(force_layout=True)
 
     def insertNodeNearestSegment(self, scene_pos):
-        rect = self.rect()
-        if rect.width() <= 0 or rect.height() <= 0:
+        local = self.mapFromScene(scene_pos)
+        points, handles = self._local_bezier_geometry()
+        seg_index, t, _nearest, _distance = nearest_segment(
+            local, points, handles, closed=False)
+        if seg_index < 0:
             return
-        local   = self.mapFromScene(scene_pos)
-        new_pt  = QPointF(
-            min(max(local.x()/rect.width(),  0.0), 1.0),
-            min(max(local.y()/rect.height(), 0.0), 1.0),
-        )
-        if len(self._nodes) < 2:
-            self._nodes.append(new_pt)
-            self.update()
-            return
-        best_i, best_d = 1, None
-        for i in range(len(self._nodes)-1):
-            d = point_segment_distance(
-                new_pt, self._nodes[i], self._nodes[i+1])
-            if best_d is None or d < best_d:
-                best_d, best_i = d, i+1
-        self._nodes.insert(best_i, new_pt)
-        self.update()
+        # Split in normalised geometry so the resulting control points persist
+        # independently of layout zoom and painter scale.
+        norm_local = QPointF(
+            local.x() / max(self.rect().width(), 1e-9),
+            local.y() / max(self.rect().height(), 1e-9))
+        seg_index, t, _nearest, _distance = nearest_segment(
+            norm_local, self._nodes, self._bezier_handles, closed=False)
+        self._nodes, self._bezier_handles, _new_index = split_segment(
+            self._nodes, self._bezier_handles, seg_index, t, closed=False)
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        self._request_spline_repaint(force_layout=True)
 
     def removeNodeAt(self, index):
         if len(self._nodes) <= 2:
             return False
-        if 0 <= index < len(self._nodes):
-            # Preserve every surviving vertex in scene space while the item
-            # rectangle contracts to the new curve bounds.
-            old_dirty = self._expanded_scene_dirty_rect()
-            remaining_scene = self.nodeScenePositions()
-            del remaining_scene[index]
-
-            xs = [point.x() for point in remaining_scene]
-            ys = [point.y() for point in remaining_scene]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            new_w = max(max_x - min_x, 5.0)
-            new_h = max(max_y - min_y, 5.0)
-
-            self.attemptSetSceneRect(QRectF(min_x, min_y, new_w, new_h))
-            self._nodes = [
-                QPointF(
-                    min(max((point.x() - min_x) / new_w, 0.0), 1.0),
-                    min(max((point.y() - min_y) / new_h, 0.0), 1.0),
-                )
-                for point in remaining_scene
-            ]
-            self._update_scene_dirty_area(
-                old_dirty, self._expanded_scene_dirty_rect())
-            self._request_spline_repaint(force_layout=True)
-            return True
-        return False
+        if not (0 <= index < len(self._nodes)):
+            return False
+        old_dirty = self._expanded_scene_dirty_rect()
+        anchors, handle_map = self._scene_geometry()
+        del anchors[index]
+        # Re-index surviving handle records after removing the anchor.
+        new_map = {}
+        for (i, kind), pt in handle_map.items():
+            if i == index:
+                continue
+            new_i = i - 1 if i > index else i
+            new_map[(new_i, kind)] = pt
+        hs = clone_handles(self._bezier_handles, len(self._nodes))
+        del hs[index]
+        # The removed node can turn its neighbour into an endpoint. Its
+        # newly-unused control is not part of an open spline and must not be
+        # allowed to keep the frame stretched out to the old handle position.
+        # Filter both the scene snapshot used for this frame update and the
+        # persisted records before calculating the replacement bounds.
+        new_count = len(anchors)
+        new_map.pop((0, "in"), None)
+        new_map.pop((new_count - 1, "out"), None)
+        self._bezier_handles = sanitise_open_handles(hs, new_count)
+        self._apply_scene_geometry(anchors, new_map)
+        self._update_scene_dirty_area(old_dirty, self._expanded_scene_dirty_rect())
+        self._request_spline_repaint(force_layout=True)
+        return True
 
     def setNodesFromScenePoints(self, scene_points):
         rect = self.rect()
@@ -2094,6 +2244,7 @@ class LayoutItemSplineText(QgsLayoutItem):
             ))
         if len(nodes) >= 2:
             self._nodes = nodes
+            self._bezier_handles = catmull_rom_handles(self._nodes)
             self.update()
 
     def setNodesFromSceneBounds(self, scene_points, scene_rect):
@@ -2107,6 +2258,7 @@ class LayoutItemSplineText(QgsLayoutItem):
             ))
         if len(nodes) >= 2:
             self._nodes = nodes
+            self._bezier_handles = catmull_rom_handles(self._nodes)
             self._request_spline_repaint(force_layout=True)
 
     # --------------------------------------------------------- properties
@@ -2151,44 +2303,10 @@ class LayoutItemSplineText(QgsLayoutItem):
     def setReversed(self, v):   self._reverse = bool(v); self.update()
 
     def _base_font_and_color(self, resolve_named_style=False):
-        f = QFont(self._text_format.font())
-        if resolve_named_style:
-            try:
-                from qgis.core import QgsFontUtils
-                family = f.family()
-                if family:
-                    try:
-                        QgsFontUtils.setFontFamily(f, family)
-                    except Exception:
-                        f.setFamily(family)
-                named_style = self._text_format.namedStyle()
-                if named_style:
-                    if not QgsFontUtils.updateFontViaStyle(
-                            f, named_style, True):
-                        f.setStyleName(named_style)
-            except Exception:
-                try:
-                    named_style = self._text_format.namedStyle()
-                    if named_style:
-                        f.setStyleName(named_style)
-                except Exception:
-                    record_suppressed_exception()
-        size = self._text_format.size()
-        if size > 0:
-            f.setPointSizeF(size)
-        elif f.pointSizeF() <= 0 and f.pixelSize() <= 0:
-            f.setPointSizeF(10.0)
-        try:
-            if self._text_format.forcedBold():
-                f.setBold(True)
-        except Exception:
-            record_suppressed_exception()
-        try:
-            if self._text_format.forcedItalic():
-                f.setItalic(True)
-        except Exception:
-            record_suppressed_exception()
-        return f, QColor(self._text_format.color())
+        return (
+            text_format_base_font(self._text_format, resolve_named_style),
+            QColor(self._text_format.color()),
+        )
 
     def _layout_signature(self, resolved_text, render_html=False, inline_html=False):
         rect = self.rect()
@@ -2201,6 +2319,7 @@ class LayoutItemSplineText(QgsLayoutItem):
                 return 0.0
 
         nodes_sig = tuple((_safe_float(n.x(), 6), _safe_float(n.y(), 6)) for n in self._nodes)
+        bezier_sig = serialise_handles(self._bezier_handles)
         text_sig = hashlib.blake2b(
             (resolved_text or "").encode("utf-8"),
             digest_size=16).digest()
@@ -2214,7 +2333,7 @@ class LayoutItemSplineText(QgsLayoutItem):
                 record_suppressed_exception()
             return (
                 "render_html", _safe_float(rect.width(), 6),
-                _safe_float(rect.height(), 6), nodes_sig, text_sig,
+                _safe_float(rect.height(), 6), nodes_sig, bezier_sig, text_sig,
                 int(self._h_align), _safe_float(self._h_margin, 6),
                 _safe_float(self._v_margin, 6),
                 _safe_float(self._letter_spacing, 6), bool(self._reverse),
@@ -2237,6 +2356,7 @@ class LayoutItemSplineText(QgsLayoutItem):
             _safe_float(rect.width(), 6),
             _safe_float(rect.height(), 6),
             nodes_sig,
+            bezier_sig,
             text_sig,
             bool(render_html),
             bool(inline_html),
@@ -2436,10 +2556,20 @@ class LayoutItemSplineText(QgsLayoutItem):
                                         w_px + 2*extra, h_px + 2*extra))
 
             nodes_px = [QPointF(n.x()*w_px, n.y()*h_px) for n in self._nodes]
+            self._bezier_handles = sanitise_open_handles(
+                self._bezier_handles, len(self._nodes))
+            handles_px = clone_handles(self._bezier_handles, len(self._nodes))
+            for rec in handles_px:
+                for kind in ("in", "out"):
+                    hp = rec.get(kind)
+                    if hp is not None:
+                        rec[kind] = QPointF(hp.x()*w_px, hp.y()*h_px)
+            edit_nodes_px = list(nodes_px)
+            edit_handles_px = clone_handles(handles_px, len(nodes_px))
             if self._reverse:
-                nodes_px = list(reversed(nodes_px))
+                nodes_px, handles_px = reverse_geometry(nodes_px, handles_px)
 
-            path   = build_smooth_path(nodes_px)
+            path   = build_bezier_path(nodes_px, handles_px, closed=False)
             mapper = PathLengthMapper(path)
 
             if self.frameEnabled():
@@ -2452,10 +2582,18 @@ class LayoutItemSplineText(QgsLayoutItem):
                     record_suppressed_exception()
                 painter.setPen(pen)
                 painter.drawPath(path)
+            elif is_preview_render and self.isSelected():
+                # Keep the editable spline path visible even when the user
+                # disables the exported/printed frame.  The guide is preview
+                # only and intentionally ignores any stored custom frame
+                # styling while the frame is off.
+                guide_pen = QPen(QColor(180, 180, 180), 0.15 * scale_factor)
+                painter.setPen(guide_pen)
+                painter.drawPath(path)
 
             if mapper.total_length <= 0:
                 if is_preview_render and self.isSelected():
-                    self._draw_handles(painter, nodes_px, scale_factor)
+                    self._draw_handles(painter, edit_nodes_px, edit_handles_px, scale_factor)
                 return
 
             cap = None
@@ -2604,7 +2742,7 @@ class LayoutItemSplineText(QgsLayoutItem):
 
             if not glyph_plan:
                 if is_preview_render and self.isSelected():
-                    self._draw_handles(painter, nodes_px, scale_factor)
+                    self._draw_handles(painter, edit_nodes_px, edit_handles_px, scale_factor)
                 return
 
             # Read each textFormat component once, then build world-space paths
@@ -2903,17 +3041,42 @@ class LayoutItemSplineText(QgsLayoutItem):
                 painter.restore()
 
             if is_preview_render and self.isSelected():
-                self._draw_handles(painter, nodes_px, scale_factor)
+                self._draw_handles(painter, edit_nodes_px, edit_handles_px, scale_factor)
         finally:
             painter.restore()
 
-    def _draw_handles(self, painter, nodes_px, scale_factor):
+    def _draw_handles(self, painter, nodes_px, handles_px, scale_factor):
         normal_pen = QPen(QColor(40,90,200), 0.25*scale_factor)
         active_pen = QPen(QColor(190,85,0), 0.35*scale_factor)
+        arm_pen = QPen(QColor(95,125,170), 0.20*scale_factor)
+        handle_pen = QPen(QColor(65,105,170), 0.22*scale_factor)
+        active_handle_pen = QPen(QColor(190,85,0), 0.32*scale_factor)
         normal_brush = QColor(255,255,255)
         active_brush = QColor(255,170,45)
+        handle_brush = QColor(225,235,250)
         r = 1.4 * scale_factor
         active_r = 1.7 * scale_factor
+        hr = 1.0 * scale_factor
+        active_hr = 1.25 * scale_factor
+        handles_px = clone_handles(handles_px, len(nodes_px))
+        for index, anchor in enumerate(nodes_px):
+            rec = handles_px[index]
+            for kind in ("in", "out"):
+                hp = rec.get(kind)
+                if hp is None:
+                    continue
+                painter.setPen(arm_pen)
+                painter.setBrush(normal_brush)
+                painter.drawLine(anchor, hp)
+                if self._active_handle == (index, kind):
+                    painter.setPen(active_handle_pen)
+                    painter.setBrush(active_brush)
+                    painter.drawRect(QRectF(hp.x()-active_hr, hp.y()-active_hr,
+                                            2*active_hr, 2*active_hr))
+                else:
+                    painter.setPen(handle_pen)
+                    painter.setBrush(handle_brush)
+                    painter.drawRect(QRectF(hp.x()-hr, hp.y()-hr, 2*hr, 2*hr))
         for index, pt in enumerate(nodes_px):
             if index == self._active_node_index:
                 painter.setPen(active_pen)
@@ -2952,6 +3115,9 @@ class LayoutItemSplineText(QgsLayoutItem):
         element.setAttribute("splineReversed","1" if self._reverse else "0")
         node_str = ";".join(f"{n.x():.6f},{n.y():.6f}" for n in self._nodes)
         element.setAttribute("splineNodes", node_str)
+        self._bezier_handles = sanitise_open_handles(
+            self._bezier_handles, len(self._nodes))
+        element.setAttribute("splineBezier", serialise_handles(self._bezier_handles))
         _append_text_format_to_element(
             element, document, context, self._text_format, "splineTextFormat")
         return True
@@ -2998,6 +3164,14 @@ class LayoutItemSplineText(QgsLayoutItem):
                 nodes.append(QPointF(float(xs), float(ys)))
             if len(nodes) >= 2:
                 self._nodes = nodes
+        bezier_text = element.attribute("splineBezier", "")
+        loaded_handles = deserialise_handles(bezier_text, len(self._nodes))
+        # v1.0.1 projects have no handle data. Recreate the exact legacy
+        # Catmull-Rom cubic controls so the saved spline looks unchanged.
+        self._bezier_handles = sanitise_open_handles(
+            loaded_handles if loaded_handles is not None
+            else catmull_rom_handles(self._nodes),
+            len(self._nodes))
         return True
 
     def clone(self):

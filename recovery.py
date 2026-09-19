@@ -31,6 +31,9 @@ from .reliability import record_suppressed_exception
 RECOVERY_PROPERTY = "curved_polygon_text/recovery_v1"
 RECOVERY_SCHEMA = 1
 _SNAPSHOT_LAYOUT_IDS = set()
+_ITEM_WRITE_SNAPSHOT_IDS = set()
+_ITEM_WRITE_SNAPSHOT_CLEAR_SCHEDULED = False
+_SCHEDULED_LAYOUT_NAMES = set()
 
 
 def _is_live_qt_object(obj):
@@ -94,12 +97,35 @@ def _serialize_full_item(item):
         return ""
 
 
-def snapshot_layout(layout):
-    """Refresh the durable manifest/recovery copy for one layout.
+def _clear_item_write_snapshot_coalescing():
+    """Clear the per-event serialization coalescing state."""
+    global _ITEM_WRITE_SNAPSHOT_CLEAR_SCHEDULED
+    _ITEM_WRITE_SNAPSHOT_IDS.clear()
+    _ITEM_WRITE_SNAPSHOT_CLEAR_SCHEDULED = False
 
-    This function can be called from an item's writePropertiesToElement() while
-    QGIS itself is serializing a layout.  The guard prevents the nested
-    item.writeXml() calls used to construct the recovery records from recursing.
+
+def _mark_item_write_snapshot(layout):
+    """Coalesce duplicate snapshots caused by one layout serialization."""
+    global _ITEM_WRITE_SNAPSHOT_CLEAR_SCHEDULED
+    key = id(layout)
+    if key in _ITEM_WRITE_SNAPSHOT_IDS:
+        return False
+    _ITEM_WRITE_SNAPSHOT_IDS.add(key)
+    if not _ITEM_WRITE_SNAPSHOT_CLEAR_SCHEDULED:
+        _ITEM_WRITE_SNAPSHOT_CLEAR_SCHEDULED = True
+        QTimer.singleShot(0, _clear_item_write_snapshot_coalescing)
+    return True
+
+
+def snapshot_layout(layout):
+    """Refresh the durable manifest/recovery copy for one live layout.
+
+    This function intentionally remains immediate for normal recovery calls.
+    Only item-serialization requests are coalesced by ``snapshot_item_layout``
+    below, so edits and lifecycle events cannot be accidentally suppressed.
+
+    The re-entrancy guard prevents the nested item.writeXml() calls used to
+    construct recovery records from recursing.
     """
     if not _is_live_qt_object(layout):
         return
@@ -153,24 +179,44 @@ def snapshot_layout_by_name(layout_name):
 
 
 def schedule_layout_snapshot(layout_name):
-    """Queue a deletion-manifest refresh without retaining a layout wrapper."""
+    """Queue a deletion-manifest refresh without retaining a layout wrapper.
+
+    Multiple item destructions can occur as one QGIS operation.  Keep at most
+    one pending callback per layout name so a batch deletion causes one
+    recovery rebuild rather than one rebuild per destroyed item.
+    """
     name = str(layout_name or "")
-    if not name:
+    if not name or name in _SCHEDULED_LAYOUT_NAMES:
         return
-    QTimer.singleShot(0, lambda name=name: snapshot_layout_by_name(name))
+    _SCHEDULED_LAYOUT_NAMES.add(name)
+
+    def _run(name=name):
+        _SCHEDULED_LAYOUT_NAMES.discard(name)
+        snapshot_layout_by_name(name)
+
+    QTimer.singleShot(0, _run)
 
 
 def snapshot_item_layout(item):
-    """Refresh the owning layout unless a recovery snapshot is already active."""
+    """Refresh the owning layout, coalescing duplicate item-write requests."""
     try:
         layout = item.layout()
     except Exception:
         layout = None
+    if not _is_live_qt_object(layout):
+        return
+    # QGIS may invoke writePropertiesToElement() once per custom item while
+    # serializing one layout. Each call used to rebuild the complete manifest,
+    # producing O(n^2) work. One snapshot is sufficient for that serialization
+    # burst because the project-level write checkpoint also performs an
+    # authoritative full snapshot before the project is written.
+    if not _mark_item_write_snapshot(layout):
+        return
     snapshot_layout(layout)
 
 
 def snapshot_project(project):
-    """Refresh all layout backups immediately before a project write."""
+    """Refresh all layout backups at an authoritative project checkpoint."""
     if project is None:
         return
     try:

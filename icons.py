@@ -35,9 +35,17 @@ def edit_spline_icon():
     return _resource_icon("edit-spline.png")
 
 
+def spline_item_icon():
+    return _resource_icon("spline_item.png")
+
+
+def polygon_item_icon():
+    return _resource_icon("polygon_item.png")
+
+
 def node_tool_icon():
     return edit_spline_icon()
 
 
 def plugin_icon():
-    return polygon_icon()
+    return polygon_item_icon()

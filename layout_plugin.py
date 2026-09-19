@@ -46,7 +46,9 @@ from .reliability import record_suppressed_exception
 from .layout_item_polygon_text import LayoutItemPolygonText, POLYGON_TEXT_ITEM_TYPE
 from .layout_item_spline_text import LayoutItemSplineText, SPLINE_TEXT_ITEM_TYPE
 from .node_edit_tool import NodeEditTool
-from .icons import edit_spline_icon, polygon_icon, spline_icon
+from .icons import (
+    edit_spline_icon, polygon_icon, polygon_item_icon, spline_icon, spline_item_icon,
+)
 from .recovery import (
     schedule_layout_snapshot,
     schedule_recovery,
@@ -155,8 +157,7 @@ class _SplineTextGuiMetadata(QgsLayoutItemAbstractGuiMetadata):
         return SplineTextPropertiesWidget(None, item)
 
     def creationIcon(self):
-        return spline_icon()
-
+        return spline_item_icon()
 
 class _PolygonTextGuiMetadata(QgsLayoutItemAbstractGuiMetadata):
     def __init__(self):
@@ -175,8 +176,7 @@ class _PolygonTextGuiMetadata(QgsLayoutItemAbstractGuiMetadata):
         return PolygonTextPropertiesWidget(None, item)
 
     def creationIcon(self):
-        return polygon_icon()
-
+        return polygon_item_icon()
 
 # ---- Plugin implementation ----------------------------------------------------
 

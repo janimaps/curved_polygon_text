@@ -20,16 +20,12 @@ created item to that type internally to call its node-management
 methods). Our items are deliberately plain QgsLayoutItem subclasses
 with their own node storage (see the design note in
 layout_item_spline_text.py), so we get the equivalent click-to-sketch
-UX by building our own tool against that same storage, using only
-stable, version-safe QgsLayoutViewTool / QGraphicsScene primitives --
-notably, this mirrors what QGIS's own C++ implementation does
-internally for its rubber band (a plain QGraphicsPathItem/
-QGraphicsPolygonItem added directly to the QgsLayout scene and removed
-once the sketch is finished or cancelled).
+UX by building our own tool against that same storage. The sketch preview is
+painted by a transparent widget over the view's viewport; it never becomes a
+QGraphicsItem in QgsLayout's scene.
 """
 from qgis.gui import QgsLayoutViewTool
 from qgis.PyQt.QtWidgets import QGraphicsPathItem
-
 from .compat import (
     QtGui, QPen, QBrush, QColor, QRectF, NO_BRUSH, DASH_LINE,
     LEFT_BUTTON, RIGHT_BUTTON, CURSOR_CROSS,
@@ -61,7 +57,7 @@ class NodeItemCreationTool(QgsLayoutViewTool):
         self._on_item_created = on_item_created  # optional callable(item), see layout_plugin._keep_alive
 
         self._points = []          # committed vertices, scene (layout) coords
-        self._rubber_item = None   # temporary QGraphicsItem preview, added to the layout scene
+        self._rubber_item = None
 
     # ------------------------------------------------------------ lifecycle
     def activate(self):
@@ -107,12 +103,22 @@ class NodeItemCreationTool(QgsLayoutViewTool):
             # user's progress; they can keep clicking or press Escape.
             return
 
+        points = list(self._points)
         layout = self.layout()
         if layout is None:
             self._cancel()
             return
 
-        points = list(self._points)
+        # Clear any existing layout selection before creating the new item.
+        # This keeps the original, proven item-creation lifecycle intact while
+        # ensuring the item drawn by this tool becomes the sole selection.
+        # Do this before the new Python-backed item exists, so no selection
+        # change can occur during item construction or scene insertion.
+        try:
+            layout.deselectAll()
+        except Exception:
+            record_suppressed_exception()
+
         xs = [p.x() for p in points]
         ys = [p.y() for p in points]
         min_x, max_x = min(xs), max(xs)
@@ -147,7 +153,6 @@ class NodeItemCreationTool(QgsLayoutViewTool):
 
         item.setNodesFromSceneBounds(points, scene_rect)
         item.setSelected(True)
-
         self._clear_rubber_band()
         self._points = []
 
@@ -177,20 +182,12 @@ class NodeItemCreationTool(QgsLayoutViewTool):
         if self._closed and len(preview_points) > 2:
             path.closeSubpath()
 
-        # Mark each already-committed vertex with a small circle so the
-        # in-progress sketch stays clearly visible even for short/thin
-        # open paths (e.g. early in a Curved Spline Text sketch), where a
-        # plain stroke alone can be easy to miss on screen.
         for pt in self._points:
             path.addEllipse(pt, NODE_MARKER_RADIUS_MM, NODE_MARKER_RADIUS_MM)
 
         if self._rubber_item is None:
             self._rubber_item = QGraphicsPathItem()
             self._rubber_item.setPen(RUBBER_BAND_PEN)
-            # NOTE: QGraphicsItem.setBrush() (unlike QPainter.setBrush())
-            # has no overload accepting a bare Qt.BrushStyle in PyQt6 --
-            # only QBrush/QColor/etc -- so NO_BRUSH must be wrapped
-            # explicitly here rather than passed directly.
             self._rubber_item.setBrush(QBrush(RUBBER_BAND_FILL) if self._closed else QBrush(NO_BRUSH))
             self._rubber_item.setZValue(1000)
             layout.addItem(self._rubber_item)
